@@ -43,6 +43,8 @@ const SEAT_WEIGHT: u64 = 25;
 const YES_WEIGHT: Uint128 = Uint128::new(3 * SEAT_WEIGHT as u128);
 const MAX_PROPOSALS_TO_CHECK: u64 = 512;
 const PROPOSALS_PER_QUERY: u64 = 12;
+#[cfg(feature = "phoenix-rotation")]
+const PROPOSALS_PER_CHECKPOINT: u64 = 4 * PROPOSALS_PER_QUERY;
 
 const MAX_GATED: usize = 64;
 #[cfg(feature = "phoenix-rotation")]
@@ -52,6 +54,10 @@ const BOUNDARY: Item<SnapshotBoundary> = Item::new("phoenix_snapshot_boundary_v1
 /// Proposals that were unresolved when a boundary was set. They snapshot an
 /// earlier roster, so the core refuses to dispatch their messages.
 const GATED: Item<Vec<u64>> = Item::new("phoenix_gated_proposals_v1");
+#[cfg(feature = "phoenix-rotation")]
+const PENDING_HISTORY: Item<PendingHistory> = Item::new("phoenix_pending_history_v1");
+#[cfg(feature = "phoenix-rotation")]
+const GUARDED_BATCH: Item<GuardedBatch> = Item::new("phoenix_guarded_batch_v1");
 
 /// This contract is built in two forms: the default build, and the build with
 /// the `phoenix-rotation` feature, which adds the host-authorized governance
@@ -135,6 +141,10 @@ struct ProposalRecord {
 struct ProposalSnapshot {
     start_height: u64,
     status: Status,
+    #[cfg(feature = "phoenix-rotation")]
+    threshold: Threshold,
+    #[cfg(feature = "phoenix-rotation")]
+    veto: Option<VetoConfig>,
 }
 
 // Decoded only for a proposal the module reports as executed.
@@ -154,6 +164,21 @@ struct ExecutedSnapshot {
 struct SnapshotBoundary {
     height: u64,
     proposal_count: u64,
+}
+
+/// Tracks work toward the next boundary without changing execution eligibility.
+#[cfg(feature = "phoenix-rotation")]
+#[cw_serde]
+struct PendingHistory {
+    through: u64,
+    unresolved: Vec<u64>,
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[cw_serde]
+struct GuardedBatch {
+    proposal_count: u64,
+    veto: Option<VetoConfig>,
 }
 
 struct PlannedBoundary {
@@ -296,34 +321,19 @@ fn is_resolved(status: &Status) -> bool {
     )
 }
 
-// Classify every proposal after `checked`. Proposals up to `reviewed` must be
-// resolved. Later ones that can still pass or execute are gated instead, so
-// creating a proposal cannot stop the boundary from being set.
-fn plan_boundary(deps: Deps, mut checked: u64, reviewed: u64) -> StdResult<PlannedBoundary> {
-    let count: u64 = deps
-        .querier
-        .query_wasm_smart(PROPOSAL, &ProposalQuery::ProposalCount {})?;
-    require(
-        count >= reviewed,
-        "proposal count is below the reviewed count",
-    )?;
-    require(
-        count
-            .checked_sub(checked)
-            .is_some_and(|n| n <= MAX_PROPOSALS_TO_CHECK),
-        "proposal count exceeds checked bound",
-    )?;
-    // No proposal hook is running while a boundary is set through sudo, and no
-    // proposal is gated before adoption, so an executed entry here is settled.
-    let mut gated = Vec::new();
-    for id in GATED.may_load(deps.storage)?.unwrap_or_default() {
-        if !is_resolved(&load_proposal(deps, id)?.status) {
-            gated.push(id);
-        }
-    }
-    let carried = gated.len();
-    while checked < count {
-        let limit = (count - checked).min(PROPOSALS_PER_QUERY);
+fn proposal_count(deps: Deps) -> StdResult<u64> {
+    deps.querier
+        .query_wasm_smart(PROPOSAL, &ProposalQuery::ProposalCount {})
+}
+
+fn visit_proposals(
+    deps: Deps,
+    mut checked: u64,
+    end: u64,
+    mut visit: impl FnMut(ProposalRecord) -> StdResult<()>,
+) -> StdResult<()> {
+    while checked < end {
+        let limit = (end - checked).min(PROPOSALS_PER_QUERY);
         let page: ProposalList = deps.querier.query_wasm_smart(
             PROPOSAL,
             &ProposalQuery::ListProposals {
@@ -338,15 +348,106 @@ fn plan_boundary(deps: Deps, mut checked: u64, reviewed: u64) -> StdResult<Plann
         for record in page.proposals {
             checked += 1;
             require(record.id == checked, "proposal history gap")?;
-            if !is_resolved(&record.proposal.status) {
-                require(
-                    record.id > reviewed,
-                    format!("resolve legacy proposal {} before adoption", record.id),
-                )?;
-                gated.push(record.id);
-            }
+            visit(record)?;
         }
     }
+    Ok(())
+}
+
+fn keep_unresolved(deps: Deps, ids: impl IntoIterator<Item = u64>) -> StdResult<Vec<u64>> {
+    let mut unresolved = Vec::new();
+    for id in ids {
+        if !is_resolved(&load_proposal(deps, id)?.status) {
+            unresolved.push(id);
+        }
+    }
+    Ok(unresolved)
+}
+
+#[cfg(feature = "phoenix-rotation")]
+fn pending_history(deps: Deps, checked: u64) -> StdResult<PendingHistory> {
+    let history = PENDING_HISTORY
+        .may_load(deps.storage)?
+        .unwrap_or(PendingHistory {
+            through: checked,
+            unresolved: vec![],
+        });
+    // The execution hook can separately classify the boundary-height tail.
+    Ok(PendingHistory {
+        through: history.through.max(checked),
+        unresolved: keep_unresolved(
+            deps,
+            history.unresolved.into_iter().filter(|&id| id > checked),
+        )?,
+    })
+}
+
+#[cfg(feature = "phoenix-rotation")]
+fn checkpoint_history(deps: DepsMut, boundary: &SnapshotBoundary) -> StdResult<Response> {
+    let mut history = pending_history(deps.as_ref(), boundary.proposal_count)?;
+    let count = proposal_count(deps.as_ref())?;
+    require(count >= history.through, "proposal count moved backwards")?;
+    let end = count.min(history.through.saturating_add(PROPOSALS_PER_CHECKPOINT));
+    visit_proposals(deps.as_ref(), history.through, end, |record| {
+        if !is_resolved(&record.proposal.status) {
+            history.unresolved.push(record.id);
+        }
+        Ok(())
+    })?;
+    require(
+        history.unresolved.len() <= MAX_GATED,
+        "too many unresolved proposals to checkpoint",
+    )?;
+    history.through = end;
+    PENDING_HISTORY.save(deps.storage, &history)?;
+    Ok(Response::new()
+        .add_attribute("action", "checkpoint_proposal_history")
+        .add_attribute("checked_through", end.to_string())
+        .add_attribute("proposal_count", count.to_string()))
+}
+
+// Classify proposals since the last boundary. Those up to the reviewed ID
+// must be resolved. Any later unresolved proposals are gated instead.
+fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBoundary> {
+    let count = proposal_count(deps)?;
+    require(
+        count >= reviewed,
+        "proposal count is below the reviewed count",
+    )?;
+    #[cfg(feature = "phoenix-rotation")]
+    let (checked, staged) = {
+        let history = pending_history(deps, checked)?;
+        (history.through, history.unresolved)
+    };
+    #[cfg(not(feature = "phoenix-rotation"))]
+    let staged: Vec<u64> = vec![];
+    require(
+        count
+            .checked_sub(checked)
+            .is_some_and(|n| n <= MAX_PROPOSALS_TO_CHECK),
+        "proposal count exceeds checked bound",
+    )?;
+    // No proposal hook is running while a boundary is set through sudo, and no
+    // proposal is gated before adoption, so an executed entry here is settled.
+    let mut gated = keep_unresolved(deps, GATED.may_load(deps.storage)?.unwrap_or_default())?;
+    let carried = gated.len();
+    let mut gate = |id| -> StdResult<()> {
+        require(
+            id > reviewed,
+            format!("resolve legacy proposal {id} before adoption"),
+        )?;
+        gated.push(id);
+        Ok(())
+    };
+    for id in staged {
+        gate(id)?;
+    }
+    visit_proposals(deps, checked, count, |record| {
+        if !is_resolved(&record.proposal.status) {
+            gate(record.id)?;
+        }
+        Ok(())
+    })?;
     require(
         gated.len() <= MAX_GATED,
         "too many unresolved proposals to block",
@@ -361,6 +462,8 @@ fn plan_boundary(deps: Deps, mut checked: u64, reviewed: u64) -> StdResult<Plann
 impl PlannedBoundary {
     /// Record the boundary and return the proposals it newly blocks.
     fn save(mut self, storage: &mut dyn Storage, height: u64) -> StdResult<Vec<u64>> {
+        #[cfg(feature = "phoenix-rotation")]
+        PENDING_HISTORY.remove(storage);
         GATED.save(storage, &self.gated)?;
         BOUNDARY.save(
             storage,
@@ -392,15 +495,10 @@ fn stays_gated(deps: Deps, id: u64, status: &Status, hook: &[SubMsg]) -> StdResu
     match status {
         Status::Rejected | Status::Closed | Status::ExecutionFailed | Status::Vetoed => Ok(false),
         Status::Executed => {
-            // The running proposal's messages reached this hook through the same
-            // type, so a record that does not decode cannot be the running one.
-            let running = deps
+            let record: ExecutedRecord = deps
                 .querier
-                .query_wasm_smart::<ExecutedRecord>(
-                    PROPOSAL,
-                    &ProposalQuery::Proposal { proposal_id: id },
-                )
-                .is_ok_and(|record| record.proposal.msgs.iter().eq(hook.iter().map(|m| &m.msg)));
+                .query_wasm_smart(PROPOSAL, &ProposalQuery::Proposal { proposal_id: id })?;
+            let running = record.proposal.msgs.iter().eq(hook.iter().map(|m| &m.msg));
             require(
                 !running,
                 format!("proposal {id} predates the current membership and cannot execute"),
@@ -486,46 +584,79 @@ pub(crate) fn gate_execution(deps: DepsMut, env: &Env, response: Response) -> St
             },
         )?;
     }
-    Ok(guard_pinned_config(response))
+    guard_pinned_config(deps, response)
 }
 
-/// Ask for a reply once the last dispatched message, and so every message of
-/// the proposal, has completed. The reply rejects the whole execution if it
-/// left the configuration that governance membership actions depend on changed.
-///
-/// This covers actions dispatched through the proposal hook. It cannot stop an
-/// out-of-band path, such as an authz grant made by the DAO and used later.
+/// The outermost hook owns the reply and checks proposals created by nested
+/// calls too. All dispatched messages and their replies share the transaction.
 #[cfg(feature = "phoenix-rotation")]
-fn guard_pinned_config(mut response: Response) -> Response {
-    if let Some(last) = response.messages.last_mut() {
+fn guard_pinned_config(deps: DepsMut, mut response: Response) -> StdResult<Response> {
+    let Some(last) = response.messages.last_mut() else {
+        return Ok(response);
+    };
+    if GUARDED_BATCH.may_load(deps.storage)?.is_none() {
+        let cfg: ProposalConfig = deps
+            .querier
+            .query_wasm_smart(PROPOSAL, &ProposalQuery::Config {})?;
+        let proposal_count = proposal_count(deps.as_ref())?;
+        GUARDED_BATCH.save(
+            deps.storage,
+            &GuardedBatch {
+                proposal_count,
+                veto: cfg.veto,
+            },
+        )?;
         last.id = GUARD_REPLY_ID;
         last.reply_on = cosmwasm_std::ReplyOn::Success;
     }
-    response
+    Ok(response)
 }
 
 #[cfg(not(feature = "phoenix-rotation"))]
-fn guard_pinned_config(response: Response) -> Response {
-    response
+fn guard_pinned_config(_deps: DepsMut, response: Response) -> StdResult<Response> {
+    Ok(response)
 }
 
 /// Handle the reply requested by the execution hook, if `id` is that reply.
 #[cfg(feature = "phoenix-rotation")]
-pub(crate) fn guard_reply(deps: Deps, env: &Env, id: u64) -> StdResult<Option<Response>> {
+pub(crate) fn guard_reply(deps: DepsMut, env: &Env, id: u64) -> StdResult<Option<Response>> {
     if id != GUARD_REPLY_ID {
         return Ok(None);
     }
-    rotation::check_membership_binding(deps, env)?;
+    let batch = GUARDED_BATCH.load(deps.storage)?;
+    let cfg = rotation::check_membership_binding(deps.as_ref(), env)?;
+    require(
+        cfg.veto == batch.veto,
+        "proposal veto configuration changed",
+    )?;
+    governance::check_current_roster(deps.as_ref())?;
     require(
         ADMIN.load(deps.storage)?.as_str() == CORE
             && NOMINATED_ADMIN.may_load(deps.storage)?.is_none(),
         "core admin or nomination changed",
     )?;
+    let count = proposal_count(deps.as_ref())?;
+    require(
+        count
+            .checked_sub(batch.proposal_count)
+            .is_some_and(|n| n <= MAX_PROPOSALS_TO_CHECK),
+        "too many proposals created during execution",
+    )?;
+    visit_proposals(deps.as_ref(), batch.proposal_count, count, |record| {
+        require(
+            record.proposal.threshold == cfg.threshold && record.proposal.veto == batch.veto,
+            format!(
+                "proposal {} saved different threshold or veto rules",
+                record.id
+            ),
+        )
+    })?;
+    GUARDED_BATCH.remove(deps.storage);
     Ok(Some(Response::new()))
 }
 
 #[cfg(not(feature = "phoenix-rotation"))]
-pub(crate) fn guard_reply(_deps: Deps, _env: &Env, _id: u64) -> StdResult<Option<Response>> {
+pub(crate) fn guard_reply(_deps: DepsMut, _env: &Env, _id: u64) -> StdResult<Option<Response>> {
     Ok(None)
 }
 

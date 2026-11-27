@@ -976,8 +976,8 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn reply(deps: DepsMut, env: Env, msg: Reply) -> Result<Response, ContractError> {
-    if let Some(response) = crate::phoenix::guard_reply(deps.as_ref(), &env, msg.id)? {
+pub fn reply(mut deps: DepsMut, env: Env, msg: Reply) -> Result<Response, ContractError> {
+    if let Some(response) = crate::phoenix::guard_reply(deps.branch(), &env, msg.id)? {
         return Ok(response);
     }
     match msg.id {

@@ -7,6 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 
 const SEND_DELAY_SECONDS: u64 = 48 * 60 * 60;
+pub(super) const MAX_MEMBERS: usize = 5;
+const MAX_MEMBERSHIP_CHANGES: usize = 12;
+#[cfg(feature = "phoenix-rotation")]
+const MAX_REPAIR_MEMBERS: usize = MAX_MEMBERS + MAX_MEMBERSHIP_CHANGES;
 const SEND_ACTIVE_AT: Item<Timestamp> = Item::new("governance_send_active_at");
 pub(super) const SEAT: Item<GovernanceSeat> = Item::new("governance_seat");
 
@@ -185,31 +189,53 @@ pub(super) fn send_as_dao(
 }
 
 #[cfg(feature = "phoenix-rotation")]
+pub(super) fn current_members(deps: Deps, max_members: usize) -> StdResult<Vec<Member>> {
+    let roster: MemberListResponse = deps.querier.query_wasm_smart(
+        GROUP,
+        &Cw4QueryMsg::ListMembers {
+            start_after: None,
+            limit: Some(max_members as u32 + 1),
+        },
+    )?;
+    require(
+        roster.members.len() <= max_members,
+        "too many group members",
+    )?;
+    Ok(roster.members)
+}
+
+#[cfg(feature = "phoenix-rotation")]
+pub(super) fn check_current_roster(deps: Deps) -> StdResult<()> {
+    let roster = current_members(deps, MAX_MEMBERS)?
+        .into_iter()
+        .map(|member| (member.addr, member.weight))
+        .collect();
+    validate_roster(&roster, SEAT.may_load(deps.storage)?.as_ref())?;
+    Ok(())
+}
+
+#[cfg(feature = "phoenix-rotation")]
 pub(super) fn reviewed_roster(
     deps: Deps,
     height: u64,
     expected: &[Member],
 ) -> StdResult<BTreeMap<String, u64>> {
-    require(expected.len() <= 6, "too many reviewed members")?;
+    require(
+        expected.len() <= MAX_REPAIR_MEMBERS,
+        "too many reviewed members",
+    )?;
     let mut roster = BTreeMap::new();
     for m in expected {
         let addr = deps.api.addr_validate(&m.addr)?.into_string();
         require(
-            m.weight > 0 && roster.insert(addr, m.weight).is_none(),
+            roster.insert(addr, m.weight).is_none(),
             "invalid reviewed members",
         )?;
     }
-    let actual: MemberListResponse = deps.querier.query_wasm_smart(
-        GROUP,
-        &Cw4QueryMsg::ListMembers {
-            start_after: None,
-            limit: Some(7),
-        },
-    )?;
+    let actual = current_members(deps, MAX_REPAIR_MEMBERS)?;
     require(
-        actual.members.len() == roster.len()
+        actual.len() == roster.len()
             && actual
-                .members
                 .iter()
                 .all(|m| roster.get(&m.addr) == Some(&m.weight)),
         "current roster or weights changed",
@@ -244,7 +270,7 @@ pub(super) fn plan_membership(
     seat: Option<&GovernanceSeat>,
 ) -> StdResult<(GroupExecute, usize)> {
     require(
-        (1..=12).contains(&changes.len()),
+        (1..=MAX_MEMBERSHIP_CHANGES).contains(&changes.len()),
         "invalid membership change count",
     )?;
     let mut seen = BTreeSet::new();
@@ -259,7 +285,6 @@ pub(super) fn plan_membership(
             }
         };
         require(seen.insert(addr.clone()), "duplicate membership operation")?;
-        require(addr != CORE && addr != GOV, "reserved membership address")?;
         match change {
             MemberChange::Add { weight, .. } => {
                 require(
@@ -286,10 +311,31 @@ pub(super) fn plan_membership(
             }
         }
     }
-    let chain_seated = seat.is_some_and(|seat| roster.contains_key(&seat.address));
+    let director_count = validate_roster(&roster, seat)?;
+    // A seat whose code or admin changed can still be removed.
+    if let Some(seat) = seat.filter(|seat| roster.contains_key(&seat.address)) {
+        check_seat(deps, seat)?;
+    }
+    Ok((GroupExecute::UpdateMembers { add, remove }, director_count))
+}
+
+fn validate_roster(
+    roster: &BTreeMap<String, u64>,
+    seat: Option<&GovernanceSeat>,
+) -> StdResult<usize> {
+    require(
+        !roster.contains_key(CORE) && !roster.contains_key(GOV),
+        "reserved membership address",
+    )?;
+    require(
+        roster.values().all(|&weight| weight > 0),
+        "expected positive member weights",
+    )?;
+    let seat_address = seat.map(|seat| seat.address.as_str());
+    let chain_seated = seat_address.is_some_and(|address| roster.contains_key(address));
     let mut directors: Vec<_> = roster
         .iter()
-        .filter(|(addr, _)| !seat.is_some_and(|seat| seat.address.as_str() == addr.as_str()))
+        .filter(|(addr, _)| Some(addr.as_str()) != seat_address)
         .map(|(_, &weight)| u128::from(weight))
         .collect();
     directors.sort_unstable_by(|a, b| b.cmp(a));
@@ -301,7 +347,7 @@ pub(super) fn plan_membership(
         )?;
     } else {
         require(
-            matches!(directors.len(), 3..=5),
+            (3..=MAX_MEMBERS).contains(&directors.len()),
             "expected three to five directors",
         )?;
     }
@@ -311,14 +357,11 @@ pub(super) fn plan_membership(
             && roster.values().map(|&w| u128::from(w)).sum::<u128>() <= u128::from(u64::MAX),
         "weights must make the threshold reachable and require three directors",
     )?;
-    if let Some(seat) = seat.filter(|_| chain_seated) {
+    if chain_seated {
         require(
             roster.values().all(|&w| w == SEAT_WEIGHT),
             "governance tie-breaking requires equal seat weights",
         )?;
-        // Only a seat that stays in the roster needs a current approval.
-        // A seat whose code or admin has changed can still be removed.
-        check_seat(deps, seat)?;
     }
-    Ok((GroupExecute::UpdateMembers { add, remove }, directors.len()))
+    Ok(directors.len())
 }

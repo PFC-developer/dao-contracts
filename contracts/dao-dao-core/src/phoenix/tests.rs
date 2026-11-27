@@ -43,6 +43,23 @@ struct FullProposal<'a> {
     start_height: u64,
     status: &'a Status,
     msgs: &'a [CosmosMsg],
+    #[cfg(feature = "phoenix-rotation")]
+    threshold: &'a Threshold,
+    #[cfg(feature = "phoenix-rotation")]
+    veto: &'a Option<VetoConfig>,
+}
+
+fn snapshot(start_height: u64, status: Status) -> ProposalSnapshot {
+    ProposalSnapshot {
+        start_height,
+        status,
+        #[cfg(feature = "phoenix-rotation")]
+        threshold: Threshold::AbsoluteCount {
+            threshold: YES_WEIGHT,
+        },
+        #[cfg(feature = "phoenix-rotation")]
+        veto: None,
+    }
 }
 
 fn fixture(
@@ -114,10 +131,7 @@ fn fixture(
         config,
         proposals: vec![ProposalRecord {
             id: 1,
-            proposal: ProposalSnapshot {
-                start_height: env.block.height - 1,
-                status: Status::Executed,
-            },
+            proposal: snapshot(env.block.height - 1, Status::Executed),
         }],
         messages: Default::default(),
     }));
@@ -171,8 +185,13 @@ fn fixture(
                     Cw4QueryMsg::Admin {} => to_json_binary(&AdminResponse {
                         admin: Some(h.group_admin.clone()),
                     }),
-                    Cw4QueryMsg::ListMembers { .. } => to_json_binary(&MemberListResponse {
-                        members: h.members.clone(),
+                    Cw4QueryMsg::ListMembers { limit, .. } => to_json_binary(&MemberListResponse {
+                        members: h
+                            .members
+                            .iter()
+                            .take(limit.unwrap_or(10) as usize)
+                            .cloned()
+                            .collect(),
                     }),
                     Cw4QueryMsg::TotalWeight { .. } => to_json_binary(&TotalWeightResponse {
                         weight: h.members.iter().map(|m| m.weight).sum(),
@@ -206,6 +225,10 @@ fn fixture(
                                 start_height: record.proposal.start_height,
                                 status: &record.proposal.status,
                                 msgs: h.messages.get(&proposal_id).map_or(&[], Vec::as_slice),
+                                #[cfg(feature = "phoenix-rotation")]
+                                threshold: &record.proposal.threshold,
+                                #[cfg(feature = "phoenix-rotation")]
+                                veto: &record.proposal.veto,
                             },
                         })
                     }
@@ -380,10 +403,7 @@ fn guards_same_block_execution_and_first_new_proposal_snapshot() {
     assert!(hook(deps.as_mut(), &env, &msgs).is_ok());
     host.borrow_mut().proposals.push(ProposalRecord {
         id: 2,
-        proposal: ProposalSnapshot {
-            start_height: adoption_height,
-            status: Status::Executed,
-        },
+        proposal: snapshot(adoption_height, Status::Executed),
     });
     host.borrow_mut().messages.insert(2, msgs.clone());
     assert!(hook(deps.as_mut(), &env, &msgs)
@@ -401,10 +421,7 @@ fn scans_all_pages_through_the_reviewed_proposal_count() {
     host.borrow_mut().proposals = (1..=count)
         .map(|id| ProposalRecord {
             id,
-            proposal: ProposalSnapshot {
-                start_height: 1,
-                status: Status::Executed,
-            },
+            proposal: snapshot(1, Status::Executed),
         })
         .collect();
     let MigrateMsg::AdoptPhoenix4856 {
@@ -421,7 +438,7 @@ fn scans_all_pages_through_the_reviewed_proposal_count() {
 
 #[test]
 fn snapshot_projection_accepts_full_child_proposal_fields() {
-    let response = br#"{"proposals":[{"id":7,"proposal":{"title":"Fixture","description":"Ignored","start_height":20,"status":"open","msgs":[],"total_power":"100"}}]}"#;
+    let response = br#"{"proposals":[{"id":7,"proposal":{"title":"Fixture","description":"Ignored","start_height":20,"status":"open","msgs":[],"total_power":"100","threshold":{"absolute_count":{"threshold":"75"}}}}]}"#;
     let result: ProposalList = from_json(response).unwrap();
     assert_eq!(result.proposals[0].id, 7);
     assert_eq!(result.proposals[0].proposal.start_height, 20);

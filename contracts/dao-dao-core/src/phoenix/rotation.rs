@@ -15,6 +15,9 @@ pub enum SudoMsg {
         expected_proposal_count: u64,
         changes: Vec<MemberChange>,
     },
+    /// Classify up to 48 proposals toward the next membership change.
+    /// Repeat until the reported cursor has caught up with the proposal count.
+    CheckpointProposalHistory {},
     SetSendAsDao {
         enabled: bool,
     },
@@ -40,6 +43,15 @@ pub fn sudo(mut deps: DepsMut, env: Env, msg: SudoMsg) -> Result<Response, Contr
     governance::check_context(&env)?;
     let boundary = BOUNDARY.load(deps.storage)?;
     match msg {
+        SudoMsg::CheckpointProposalHistory {} => {
+            // Trust the pinned module's terminal statuses even when its core
+            // registration needs to be repaired by the next membership action.
+            require(
+                deps.querier.query_wasm_contract_info(PROPOSAL)?.code_id == 2642,
+                "unexpected proposal module code",
+            )?;
+            Ok(checkpoint_history(deps, &boundary)?)
+        }
         SudoMsg::SetSendAsDao { enabled } => Ok(governance::set_send_enabled(
             deps.storage,
             env.block.time,
@@ -159,7 +171,7 @@ fn with_restored(response: Response, restored: Response) -> Response {
         .add_attributes(restored.attributes)
 }
 
-pub(super) fn check_membership_binding(deps: Deps, env: &Env) -> StdResult<()> {
+pub(super) fn check_membership_binding(deps: Deps, env: &Env) -> StdResult<ProposalConfig> {
     check_binding(deps, env)?;
     check_proposal_module(deps)?;
     let cfg: ProposalConfig = deps
@@ -172,7 +184,8 @@ pub(super) fn check_membership_binding(deps: Deps, env: &Env) -> StdResult<()> {
                     threshold: YES_WEIGHT,
                 }),
         "proposal threshold or DAO changed",
-    )
+    )?;
+    Ok(cfg)
 }
 
 fn replace_member(
@@ -185,23 +198,16 @@ fn replace_member(
 ) -> Result<Response, ContractError> {
     let outgoing = deps.api.addr_validate(&outgoing)?.into_string();
     let incoming = deps.api.addr_validate(&incoming)?.into_string();
-    let roster: MemberListResponse = deps.querier.query_wasm_smart(
-        GROUP,
-        &Cw4QueryMsg::ListMembers {
-            start_after: None,
-            limit: Some(7),
-        },
-    )?;
+    let roster = governance::current_members(deps.as_ref(), governance::MAX_MEMBERS)?;
     require(
         expected_weight == SEAT_WEIGHT
             && roster
-                .members
                 .iter()
                 .any(|m| m.addr == outgoing && m.weight == expected_weight),
         "outgoing seat or expected weight changed",
     )?;
     let seat = governance::SEAT.may_load(deps.storage)?;
-    let roster = governance::reviewed_roster(deps.as_ref(), env.block.height, &roster.members)?;
+    let roster = governance::reviewed_roster(deps.as_ref(), env.block.height, &roster)?;
     let (membership, _) = governance::plan_membership(
         deps.as_ref(),
         roster,

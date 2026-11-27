@@ -3490,6 +3490,20 @@
         "additionalProperties": false
       },
       {
+        "description": "Classify up to 48 proposals toward the next membership change. Repeat until the reported cursor has caught up with the proposal count.",
+        "type": "object",
+        "required": [
+          "checkpoint_proposal_history"
+        ],
+        "properties": {
+          "checkpoint_proposal_history": {
+            "type": "object",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      {
         "type": "object",
         "required": [
           "set_send_as_dao"

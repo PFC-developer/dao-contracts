@@ -11,10 +11,7 @@ fn push(host: &Rc<RefCell<Host>>, start_height: u64, status: Status) -> u64 {
     let id = host.proposals.len() as u64 + 1;
     host.proposals.push(ProposalRecord {
         id,
-        proposal: ProposalSnapshot {
-            start_height,
-            status,
-        },
+        proposal: snapshot(start_height, status),
     });
     id
 }
@@ -360,7 +357,7 @@ fn membership_update_gates_only_proposals_after_the_reviewed_count() {
 #[cfg(feature = "phoenix-rotation")]
 #[test]
 fn execution_requests_a_reply_that_enforces_the_pinned_configuration() {
-    use cosmwasm_std::{Reply, ReplyOn, SubMsgResponse, SubMsgResult};
+    use cosmwasm_std::ReplyOn;
     let (mut deps, mut env, host) = settled(&[]);
     env.block.height += 1;
     let msgs = [fixture_msg("first"), fixture_msg("last")].concat();
@@ -376,17 +373,10 @@ fn execution_requests_a_reply_that_enforces_the_pinned_configuration() {
     assert_eq!((&first.msg, &last.msg), (&msgs[0], &msgs[1]));
     assert!(hook(deps.as_mut(), &env, &[]).unwrap().messages.is_empty());
 
-    let check = |deps: DepsMut| {
-        let reply = Reply {
-            id: GUARD_REPLY_ID,
-            result: SubMsgResult::Ok(SubMsgResponse {
-                events: vec![],
-                data: None,
-            }),
-        };
-        contract::reply(deps, env.clone(), reply).map_err(|err| err.to_string())
-    };
+    let check = |deps: DepsMut| finish_guard(deps, &env).map_err(|err| err.to_string());
     assert_eq!(check(deps.as_mut()), Ok(Response::new()));
+    assert!(GUARDED_BATCH.may_load(&deps.storage).unwrap().is_none());
+    hook(deps.as_mut(), &env, &msgs).unwrap();
 
     let pinned = host.borrow().config.threshold.clone();
     host.borrow_mut().config.threshold = Threshold::AbsoluteCount {
@@ -449,4 +439,177 @@ fn execution_requests_a_reply_that_enforces_the_pinned_configuration() {
         .unwrap();
 
     assert_eq!(check(deps.as_mut()), Ok(Response::new()));
+}
+
+#[cfg(feature = "phoenix-rotation")]
+fn finish_guard(deps: DepsMut, env: &Env) -> Result<Response, ContractError> {
+    use cosmwasm_std::{Reply, SubMsgResponse, SubMsgResult};
+    let reply = Reply {
+        id: GUARD_REPLY_ID,
+        result: SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: None,
+        }),
+    };
+    contract::reply(deps, env.clone(), reply)
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn guard_checks_new_snapshots_against_protected_threshold_and_veto() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    let veto = Some(VetoConfig {
+        timelock_duration: Duration::Time(60),
+        vetoer: GOV.to_owned(),
+        early_execute: false,
+        veto_before_passed: true,
+    });
+    host.borrow_mut().config.veto = veto.clone();
+    hook(deps.as_mut(), &env, &fixture_msg("ordinary")).unwrap();
+    let nested = hook(deps.as_mut(), &env, &fixture_msg("nested")).unwrap();
+    assert_eq!(nested.messages[0].reply_on, cosmwasm_std::ReplyOn::Never);
+
+    for _ in 0..PROPOSALS_PER_QUERY {
+        push(&host, env.block.height, Status::Open);
+        host.borrow_mut()
+            .proposals
+            .last_mut()
+            .unwrap()
+            .proposal
+            .veto = veto.clone();
+    }
+    let id = push(&host, env.block.height, Status::Open);
+    let expected = format!("proposal {id} saved different threshold or veto rules");
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains(&expected));
+    let mut h = host.borrow_mut();
+    let proposal = &mut h.proposals.last_mut().unwrap().proposal;
+    proposal.veto = veto.clone();
+    proposal.threshold = Threshold::AbsoluteCount {
+        threshold: Uint128::new(50),
+    };
+    drop(h);
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains(&expected));
+    let mut h = host.borrow_mut();
+    h.proposals.last_mut().unwrap().proposal.threshold = Threshold::AbsoluteCount {
+        threshold: YES_WEIGHT,
+    };
+    h.config.veto = None;
+    drop(h);
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("proposal veto configuration changed"));
+    host.borrow_mut().config.veto = veto;
+    assert_eq!(finish_guard(deps.as_mut(), &env).unwrap(), Response::new());
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn guard_validates_roster_and_governance_can_repair_oversized_group() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    hook(deps.as_mut(), &env, &fixture_msg("ordinary")).unwrap();
+    host.borrow_mut().members[0].weight = 50;
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("require three directors"));
+    let mut h = host.borrow_mut();
+    h.members[0].weight = 25;
+    let mut changes = vec![];
+    for i in 0..4 {
+        let address = format!("fixture-extra-{i}");
+        h.members.push(Member {
+            addr: address.clone(),
+            weight: 0,
+        });
+        changes.push(MemberChange::Remove { address });
+    }
+    let expected_members = h.members.clone();
+    drop(h);
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("too many group members"));
+    // A rejected hook rolls all of its state back before a later sudo call.
+    GUARDED_BATCH.remove(&mut deps.storage);
+    let response = sudo(
+        deps.as_mut(),
+        env,
+        SudoMsg::UpdateMembership {
+            expected_members,
+            expected_proposal_count: 1,
+            changes,
+        },
+    )
+    .unwrap();
+    let CosmosMsg::Wasm(WasmMsg::Execute { msg, .. }) = &response.messages[0].msg else {
+        panic!("expected a group update");
+    };
+    assert!(
+        matches!(from_json(msg).unwrap(), GroupExecute::UpdateMembers { add, remove }
+        if add.is_empty() && remove.len() == 4)
+    );
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn checkpoint_handles_large_history_without_changing_execution_eligibility() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    let open = push(&host, env.block.height, Status::Passed);
+    let second = push(&host, env.block.height, Status::Open);
+    for _ in 0..MAX_PROPOSALS_TO_CHECK {
+        push(&host, env.block.height, Status::Closed);
+    }
+    let count = host.borrow().proposals.len();
+    let update = |expected_proposal_count| SudoMsg::UpdateMembership {
+        expected_members: host.borrow().members.clone(),
+        expected_proposal_count,
+        changes: swap_member(),
+    };
+    assert!(sudo(deps.as_mut(), env.clone(), update(1))
+        .unwrap_err()
+        .to_string()
+        .contains("proposal count exceeds checked bound"));
+    let checkpoint =
+        |deps: DepsMut| sudo(deps, env.clone(), SudoMsg::CheckpointProposalHistory {}).unwrap();
+    let first = checkpoint(deps.as_mut());
+    assert_eq!(attribute(&first, "checked_through"), Some("49"));
+    assert_eq!(
+        attribute(&first, "proposal_count"),
+        Some(count.to_string().as_str())
+    );
+    for _ in 0..(count as u64 / PROPOSALS_PER_CHECKPOINT) {
+        checkpoint(deps.as_mut());
+    }
+    assert_eq!(
+        PENDING_HISTORY.load(&deps.storage).unwrap().through,
+        count as u64
+    );
+    assert_eq!(cursor(&deps), 1);
+    assert!(gated(&deps).is_empty());
+
+    // A staged proposal can execute until a boundary makes it stale.
+    let messages = fixture_msg("still eligible");
+    set_msgs(&host, open, &messages);
+    set_status(&host, open, Status::Executed);
+    hook(deps.as_mut(), &env, &messages).unwrap();
+    finish_guard(deps.as_mut(), &env).unwrap();
+    assert!(sudo(deps.as_mut(), env.clone(), update(second))
+        .unwrap_err()
+        .to_string()
+        .contains(&format!("resolve legacy proposal {second}")));
+    let response = sudo(deps.as_mut(), env, update(open)).unwrap();
+    assert_eq!(attribute(&response, "gated_proposals"), Some("3"));
+    assert_eq!(cursor(&deps), count as u64);
+    assert_eq!(gated(&deps), vec![second]);
+    assert!(PENDING_HISTORY.may_load(&deps.storage).unwrap().is_none());
 }

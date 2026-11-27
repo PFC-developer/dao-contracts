@@ -297,13 +297,20 @@ fn check_deadlock(
                 }),
         "proposal is not open under the supported voting rules",
     )?;
-    let opposed = proposal.votes.no == weight * Uint128::from(directors - 2);
-    let silence = proposal.votes.no.is_zero()
-        && height >= proposal.start_height.saturating_add(config.response_blocks);
+    // The seat has not voted, so every recorded ballot belongs to a director.
+    // Two director YES votes leave the proposal one seat short of the
+    // threshold. It qualifies once no further director ballot can arrive, or
+    // once the remaining directors have had the full response window. A NO,
+    // an abstention, or a missing ballot cannot withhold the deciding vote.
+    let cast = proposal
+        .votes
+        .yes
+        .checked_add(proposal.votes.no)?
+        .checked_add(proposal.votes.abstain)?;
+    let complete = cast == weight.checked_mul(Uint128::from(directors))?;
+    let elapsed = height >= proposal.start_height.saturating_add(config.response_blocks);
     require(
-        proposal.votes.yes == weight * Uint128::new(2)
-            && proposal.votes.abstain.is_zero()
-            && (opposed || silence),
+        proposal.votes.yes == weight.checked_mul(Uint128::new(2))? && (complete || elapsed),
         "proposal is not deadlocked",
     )
 }
@@ -359,11 +366,52 @@ mod tests {
     }
 
     #[test]
-    fn refuses_closed_proposals_changed_rules_and_other_vote_splits() {
-        for (yes, no, abstain) in [(25, 50, 0), (50, 25, 0), (50, 0, 25), (75, 0, 0)] {
-            let (proposal, config) = setup(yes, no, abstain);
-            assert!(check_deadlock(&proposal, 4, &config, 110).is_err());
+    fn abstentions_complete_the_ballot_without_blocking_the_seat() {
+        // Three directors: two YES and one ABSTAIN.
+        let (proposal, config) = setup(50, 0, 25);
+        assert!(check_deadlock(&proposal, 3, &config, 101).is_ok());
+        // Four directors: two YES, one NO and one ABSTAIN.
+        let (proposal, config) = setup(50, 25, 25);
+        assert!(check_deadlock(&proposal, 4, &config, 101).is_ok());
+        // Four directors: two YES and two ABSTAIN.
+        let (proposal, config) = setup(50, 0, 50);
+        assert!(check_deadlock(&proposal, 4, &config, 101).is_ok());
+    }
+
+    #[test]
+    fn partial_ballots_qualify_only_after_the_response_window() {
+        // Four directors with one ballot missing: NO or ABSTAIN beside two YES.
+        for (no, abstain) in [(25, 0), (0, 25)] {
+            let (proposal, config) = setup(50, no, abstain);
+            assert!(check_deadlock(&proposal, 4, &config, 101).is_err());
+            assert!(check_deadlock(&proposal, 4, &config, 109).is_err());
+            assert!(check_deadlock(&proposal, 4, &config, 110).is_ok());
         }
+    }
+
+    #[test]
+    fn requires_exactly_two_director_yes_votes() {
+        for (yes, no, abstain) in [
+            (0, 0, 0),
+            (25, 0, 0),
+            (25, 50, 0),
+            (25, 75, 0),
+            (25, 25, 50),
+            (75, 0, 0),
+            (75, 25, 0),
+            (100, 0, 0),
+        ] {
+            let (proposal, config) = setup(yes, no, abstain);
+            for directors in [3, 4] {
+                for height in [101, 110, 1_000] {
+                    assert!(check_deadlock(&proposal, directors, &config, height).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_closed_proposals_and_changed_rules() {
         let (mut proposal, config) = setup(50, 50, 0);
         proposal.status = Status::Passed;
         assert!(check_deadlock(&proposal, 4, &config, 110).is_err());

@@ -10,9 +10,11 @@ and no ordinary transaction entry point.
   include the seat and three or four equal-weight directors. The proposal must
   be open under a three-YES absolute threshold, with neither delegation nor
   revoting enabled.
-- Two director YES votes and all other directors voting NO qualify immediately.
-  Two YES votes and no remaining ballots qualify once the response window has
-  elapsed. An abstention or a mixture of NO and absent ballots does not qualify.
+- A proposal qualifies when exactly two directors have voted YES and the seat
+  has not voted. It qualifies immediately once every director has cast a
+  ballot, whether NO or ABSTAIN. If any director ballot is missing, it
+  qualifies once the response window has elapsed, whatever the other directors
+  did. One YES, or three or more, never qualifies.
 - Configure the contract as the proposal module's vetoer to enable veto.
   The module applies its own veto window, status transition, and completion hooks.
   A veto does not require a voting seat.

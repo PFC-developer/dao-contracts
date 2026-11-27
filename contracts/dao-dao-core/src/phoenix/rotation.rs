@@ -159,8 +159,7 @@ fn with_restored(response: Response, restored: Response) -> Response {
         .add_attributes(restored.attributes)
 }
 
-#[allow(dead_code)]
-fn check_membership_binding(deps: Deps, env: &Env) -> StdResult<()> {
+pub(super) fn check_membership_binding(deps: Deps, env: &Env) -> StdResult<()> {
     check_binding(deps, env)?;
     check_proposal_module(deps)?;
     let cfg: ProposalConfig = deps
@@ -217,35 +216,32 @@ fn replace_member(
         ],
         seat.as_ref(),
     )?;
-    let count = deps
-        .querier
-        .query_wasm_smart(PROPOSAL, &ProposalQuery::ProposalCount {})?;
-    Ok(update_membership(deps, env, boundary, count, membership)?
-        .add_attribute("outgoing", outgoing)
-        .add_attribute("incoming", incoming)
-        .add_attribute("weight", expected_weight.to_string()))
+    // No count was reviewed for a replacement. Every proposal since the last
+    // boundary that can still pass or execute is blocked.
+    let reviewed = boundary.proposal_count;
+    Ok(
+        update_membership(deps, env, boundary, reviewed, membership)?
+            .add_attribute("outgoing", outgoing)
+            .add_attribute("incoming", incoming)
+            .add_attribute("weight", expected_weight.to_string()),
+    )
 }
 
 fn update_membership(
     deps: DepsMut,
     env: Env,
     boundary: SnapshotBoundary,
-    count: u64,
+    reviewed: u64,
     membership: GroupExecute,
 ) -> Result<Response, ContractError> {
-    check_drained_proposals(deps.as_ref(), boundary.proposal_count, count)?;
-    BOUNDARY.save(
-        deps.storage,
-        &SnapshotBoundary {
-            height: env.block.height,
-            proposal_count: count,
-        },
-    )?;
-    Ok(Response::new()
+    let gated = plan_boundary(deps.as_ref(), boundary.proposal_count, reviewed)?
+        .save(deps.storage, env.block.height)?;
+    let response = Response::new()
         .add_message(WasmMsg::Execute {
             contract_addr: GROUP.to_owned(),
             msg: to_json_binary(&membership)?,
             funds: vec![],
         })
-        .add_attribute("action", "update_governance_membership"))
+        .add_attribute("action", "update_governance_membership");
+    Ok(gated_attribute(response, &gated))
 }

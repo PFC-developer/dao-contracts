@@ -27,6 +27,22 @@ struct Host {
     block_start_weight: Option<u64>,
     config: ProposalConfig,
     proposals: Vec<ProposalRecord>,
+    /// Messages of the proposals that carry any, by proposal ID.
+    messages: std::collections::BTreeMap<u64, Vec<CosmosMsg>>,
+}
+
+// The single-proposal query as the deployed module answers it, with messages.
+#[derive(serde::Serialize)]
+struct FullRecord<'a> {
+    id: u64,
+    proposal: FullProposal<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct FullProposal<'a> {
+    start_height: u64,
+    status: &'a Status,
+    msgs: &'a [CosmosMsg],
 }
 
 fn fixture(
@@ -103,6 +119,7 @@ fn fixture(
                 status: Status::Executed,
             },
         }],
+        messages: Default::default(),
     }));
     let querier_host = host.clone();
     let height = env.block.height;
@@ -176,6 +193,21 @@ fn fixture(
                     ProposalQuery::ProposalCount {} => to_json_binary(&h.proposals.len()),
                     ProposalQuery::ProposalCreationPolicy {} => {
                         to_json_binary(&ProposalCreationPolicy::Anyone {})
+                    }
+                    ProposalQuery::Proposal { proposal_id } => {
+                        let record = h
+                            .proposals
+                            .iter()
+                            .find(|p| p.id == proposal_id)
+                            .expect("unknown proposal");
+                        to_json_binary(&FullRecord {
+                            id: record.id,
+                            proposal: FullProposal {
+                                start_height: record.proposal.start_height,
+                                status: &record.proposal.status,
+                                msgs: h.messages.get(&proposal_id).map_or(&[], Vec::as_slice),
+                            },
+                        })
                     }
                     ProposalQuery::ListProposals { start_after, limit } => {
                         to_json_binary(&ProposalList {
@@ -322,7 +354,19 @@ fn rejects_actionable_legacy_and_changed_proposal_count() {
     assert!(migrate(deps.as_mut(), env, payload)
         .unwrap_err()
         .to_string()
-        .contains("proposal count changed"));
+        .contains("proposal count is below the reviewed count"));
+}
+
+fn hook(deps: DepsMut, env: &Env, msgs: &[CosmosMsg]) -> StdResult<Response> {
+    gate_execution(deps, env, Response::new().add_messages(msgs.to_vec()))
+}
+
+fn fixture_msg(tag: &str) -> Vec<CosmosMsg> {
+    vec![CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: format!("fixture-{tag}"),
+        msg: Binary::default(),
+        funds: vec![],
+    })]
 }
 
 #[test]
@@ -330,9 +374,10 @@ fn guards_same_block_execution_and_first_new_proposal_snapshot() {
     let (mut deps, mut env, host, payload) = fixture(4);
     migrate(deps.as_mut(), env.clone(), payload).unwrap();
     let adoption_height = env.block.height;
-    assert!(check_snapshot_boundary(deps.as_ref(), &env).is_err());
+    let msgs = fixture_msg("stale");
+    assert!(hook(deps.as_mut(), &env, &msgs).is_err());
     env.block.height += 1;
-    assert!(check_snapshot_boundary(deps.as_ref(), &env).is_ok());
+    assert!(hook(deps.as_mut(), &env, &msgs).is_ok());
     host.borrow_mut().proposals.push(ProposalRecord {
         id: 2,
         proposal: ProposalSnapshot {
@@ -340,9 +385,13 @@ fn guards_same_block_execution_and_first_new_proposal_snapshot() {
             status: Status::Executed,
         },
     });
-    assert!(check_snapshot_boundary(deps.as_ref(), &env).is_err());
+    host.borrow_mut().messages.insert(2, msgs.clone());
+    assert!(hook(deps.as_mut(), &env, &msgs)
+        .unwrap_err()
+        .to_string()
+        .contains("proposal 2 predates the current membership"));
     host.borrow_mut().proposals[1].proposal.start_height = adoption_height + 1;
-    assert!(check_snapshot_boundary(deps.as_ref(), &env).is_ok());
+    assert!(hook(deps.as_mut(), &env, &msgs).is_ok());
 }
 
 #[test]
@@ -550,3 +599,4 @@ fn sudo_rotation_updates_exactly_one_equal_weight_seat_even_while_paused() {
 }
 
 mod controls;
+mod gate;

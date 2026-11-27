@@ -141,8 +141,7 @@ pub fn execute(
         }
         ExecuteMsg::ExecuteProposalHook { msgs } => {
             let response = execute_proposal_hook(deps.as_ref(), info.sender, msgs)?;
-            crate::phoenix::check_snapshot_boundary(deps.as_ref(), &env)?;
-            Ok(response)
+            Ok(crate::phoenix::gate_execution(deps, &env, response)?)
         }
         ExecuteMsg::Pause { duration } => execute_pause(deps, env, info.sender, duration),
         ExecuteMsg::Unpause {} => execute_unpause(deps, info.sender),
@@ -977,7 +976,10 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> Result<Response, ContractError> {
+pub fn reply(deps: DepsMut, env: Env, msg: Reply) -> Result<Response, ContractError> {
+    if let Some(response) = crate::phoenix::guard_reply(deps.as_ref(), &env, msg.id)? {
+        return Ok(response);
+    }
     match msg.id {
         PROPOSAL_MODULE_REPLY_ID => {
             let res = parse_reply_instantiate_data(msg)?;

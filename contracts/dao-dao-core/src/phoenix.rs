@@ -2,8 +2,8 @@ use cosmwasm_schema::cw_serde;
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_json_binary, Addr, Deps, DepsMut, Env, HexBinary, Order, Response, StdError, StdResult,
-    Uint128, WasmMsg,
+    to_json_binary, Addr, CosmosMsg, Deps, DepsMut, Empty, Env, HexBinary, Order, Response,
+    StdError, StdResult, Storage, SubMsg, Uint128, WasmMsg,
 };
 use cw2::get_contract_version;
 use cw4::{AdminResponse, Cw4QueryMsg, MemberListResponse, MemberResponse, TotalWeightResponse};
@@ -44,7 +44,14 @@ const YES_WEIGHT: Uint128 = Uint128::new(3 * SEAT_WEIGHT as u128);
 const MAX_PROPOSALS_TO_CHECK: u64 = 512;
 const PROPOSALS_PER_QUERY: u64 = 12;
 
+const MAX_GATED: usize = 64;
+#[cfg(feature = "phoenix-rotation")]
+const GUARD_REPLY_ID: u64 = 4856;
+
 const BOUNDARY: Item<SnapshotBoundary> = Item::new("phoenix_snapshot_boundary_v1");
+/// Proposals that were unresolved when a boundary was set. They snapshot an
+/// earlier roster, so the core refuses to dispatch their messages.
+const GATED: Item<Vec<u64>> = Item::new("phoenix_gated_proposals_v1");
 
 /// This contract is built in two forms: the default build, and the build with
 /// the `phoenix-rotation` feature, which adds the host-authorized governance
@@ -61,7 +68,9 @@ pub enum MigrateMsg {
         outgoing: String,
         expected_proposal_config: ProposalConfig,
         expected_creation_policy: ProposalCreationPolicy,
-        /// Fail if any proposal was created after the review snapshot.
+        /// Proposal count at the review snapshot. Every proposal up to it must be
+        /// resolved. Later proposals do not stop adoption, but any of them still
+        /// unresolved at adoption is permanently blocked from executing.
         expected_proposal_count: u64,
         /// Optional settings for the transition. Omitted values retain the original adoption path.
         governance: Option<GovernanceOptions>,
@@ -86,6 +95,9 @@ enum ProposalQuery {
     Config {},
     ProposalCreationPolicy {},
     ProposalCount {},
+    Proposal {
+        proposal_id: u64,
+    },
     ListProposals {
         start_after: Option<u64>,
         limit: u64,
@@ -125,10 +137,29 @@ struct ProposalSnapshot {
     status: Status,
 }
 
+// Decoded only for a proposal the module reports as executed.
+#[derive(serde::Deserialize)]
+struct ExecutedRecord {
+    proposal: ExecutedSnapshot,
+}
+
+#[derive(serde::Deserialize)]
+struct ExecutedSnapshot {
+    msgs: Vec<CosmosMsg<Empty>>,
+}
+
+/// `proposal_count` is a cursor. Every proposal up to it has been classified
+/// as resolved or recorded in `GATED`.
 #[cw_serde]
 struct SnapshotBoundary {
     height: u64,
     proposal_count: u64,
+}
+
+struct PlannedBoundary {
+    proposal_count: u64,
+    gated: Vec<u64>,
+    added: usize,
 }
 
 fn require(condition: bool, message: impl Into<String>) -> StdResult<()> {
@@ -246,17 +277,51 @@ fn check_roster(deps: Deps, height: u64, members: &[String], outgoing: &str) -> 
     Ok(())
 }
 
-fn check_drained_proposals(deps: Deps, mut checked: u64, expected: u64) -> StdResult<()> {
+fn load_proposal(deps: Deps, id: u64) -> StdResult<ProposalSnapshot> {
+    let record: ProposalRecord = deps
+        .querier
+        .query_wasm_smart(PROPOSAL, &ProposalQuery::Proposal { proposal_id: id })?;
+    require(record.id == id, "unexpected proposal record")?;
+    Ok(record.proposal)
+}
+
+fn is_resolved(status: &Status) -> bool {
+    matches!(
+        status,
+        Status::Rejected
+            | Status::Closed
+            | Status::Executed
+            | Status::ExecutionFailed
+            | Status::Vetoed
+    )
+}
+
+// Classify every proposal after `checked`. Proposals up to `reviewed` must be
+// resolved. Later ones that can still pass or execute are gated instead, so
+// creating a proposal cannot stop the boundary from being set.
+fn plan_boundary(deps: Deps, mut checked: u64, reviewed: u64) -> StdResult<PlannedBoundary> {
     let count: u64 = deps
         .querier
         .query_wasm_smart(PROPOSAL, &ProposalQuery::ProposalCount {})?;
-    require(count == expected, "proposal count changed since review")?;
+    require(
+        count >= reviewed,
+        "proposal count is below the reviewed count",
+    )?;
     require(
         count
             .checked_sub(checked)
             .is_some_and(|n| n <= MAX_PROPOSALS_TO_CHECK),
         "proposal count exceeds checked bound",
     )?;
+    // No proposal hook is running while a boundary is set through sudo, and no
+    // proposal is gated before adoption, so an executed entry here is settled.
+    let mut gated = Vec::new();
+    for id in GATED.may_load(deps.storage)?.unwrap_or_default() {
+        if !is_resolved(&load_proposal(deps, id)?.status) {
+            gated.push(id);
+        }
+    }
+    let carried = gated.len();
     while checked < count {
         let limit = (count - checked).min(PROPOSALS_PER_QUERY);
         let page: ProposalList = deps.querier.query_wasm_smart(
@@ -273,47 +338,195 @@ fn check_drained_proposals(deps: Deps, mut checked: u64, expected: u64) -> StdRe
         for record in page.proposals {
             checked += 1;
             require(record.id == checked, "proposal history gap")?;
-            require(
-                matches!(
-                    record.proposal.status,
-                    Status::Rejected
-                        | Status::Closed
-                        | Status::Executed
-                        | Status::ExecutionFailed
-                        | Status::Vetoed
-                ),
-                format!("resolve legacy proposal {} before adoption", record.id),
-            )?;
+            if !is_resolved(&record.proposal.status) {
+                require(
+                    record.id > reviewed,
+                    format!("resolve legacy proposal {} before adoption", record.id),
+                )?;
+                gated.push(record.id);
+            }
         }
     }
-    Ok(())
+    require(
+        gated.len() <= MAX_GATED,
+        "too many unresolved proposals to block",
+    )?;
+    Ok(PlannedBoundary {
+        proposal_count: count,
+        added: gated.len() - carried,
+        gated,
+    })
 }
 
-// v2.4.0's execution hook contains no proposal ID. Check the first proposal
-// after the reviewed range to detect any creation at the mutation height.
-// The source module assigns contiguous IDs in increasing chain height order.
-pub(crate) fn check_snapshot_boundary(deps: Deps, env: &Env) -> StdResult<()> {
+impl PlannedBoundary {
+    /// Record the boundary and return the proposals it newly blocks.
+    fn save(mut self, storage: &mut dyn Storage, height: u64) -> StdResult<Vec<u64>> {
+        GATED.save(storage, &self.gated)?;
+        BOUNDARY.save(
+            storage,
+            &SnapshotBoundary {
+                height,
+                proposal_count: self.proposal_count,
+            },
+        )?;
+        Ok(self.gated.split_off(self.gated.len() - self.added))
+    }
+}
+
+fn gated_attribute(response: Response, gated: &[u64]) -> Response {
+    if gated.is_empty() {
+        return response;
+    }
+    let ids: Vec<_> = gated.iter().map(u64::to_string).collect();
+    response.add_attribute("gated_proposals", ids.join(","))
+}
+
+// Whether a proposal that predates the boundary must stay gated. Fails when it
+// is the proposal whose messages are being dispatched now.
+//
+// v2.4.0's execution hook contains no proposal ID. The module marks a proposal
+// executed before it calls the hook with that proposal's messages, and marks a
+// proposal with no messages executed without calling the core at all. An
+// executed proposal with other messages is therefore settled, not running.
+fn stays_gated(deps: Deps, id: u64, status: &Status, hook: &[SubMsg]) -> StdResult<bool> {
+    match status {
+        Status::Rejected | Status::Closed | Status::ExecutionFailed | Status::Vetoed => Ok(false),
+        Status::Executed => {
+            // The running proposal's messages reached this hook through the same
+            // type, so a record that does not decode cannot be the running one.
+            let running = deps
+                .querier
+                .query_wasm_smart::<ExecutedRecord>(
+                    PROPOSAL,
+                    &ProposalQuery::Proposal { proposal_id: id },
+                )
+                .is_ok_and(|record| record.proposal.msgs.iter().eq(hook.iter().map(|m| &m.msg)));
+            require(
+                !running,
+                format!("proposal {id} predates the current membership and cannot execute"),
+            )?;
+            Ok(false)
+        }
+        _ => Ok(true),
+    }
+}
+
+/// Runs on every proposal execution hook, before its messages are dispatched.
+///
+/// Refuses a proposal that was unresolved when the boundary was set, or that
+/// was created at the boundary height after it. Other proposals execute
+/// normally. The source module assigns contiguous IDs in increasing chain
+/// height order.
+pub(crate) fn gate_execution(deps: DepsMut, env: &Env, response: Response) -> StdResult<Response> {
     let Some(boundary) = BOUNDARY.may_load(deps.storage)? else {
-        return Ok(());
+        return Ok(response);
     };
     require(
         env.block.height > boundary.height,
         "proposal execution blocked at adoption height",
     )?;
-    let page: ProposalList = deps.querier.query_wasm_smart(
-        PROPOSAL,
-        &ProposalQuery::ListProposals {
-            start_after: Some(boundary.proposal_count),
-            limit: 1,
-        },
+    let stored = GATED.may_load(deps.storage)?.unwrap_or_default();
+    let mut gated = Vec::with_capacity(stored.len());
+    for &id in &stored {
+        let proposal = load_proposal(deps.as_ref(), id)?;
+        if stays_gated(deps.as_ref(), id, &proposal.status, &response.messages)? {
+            gated.push(id);
+        }
+    }
+    // Proposals created at the boundary height after the boundary was set are
+    // only visible later. The common case is one query that finds none.
+    let mut cursor = boundary.proposal_count;
+    let mut limit = 1;
+    'tail: loop {
+        let page: ProposalList = deps.querier.query_wasm_smart(
+            PROPOSAL,
+            &ProposalQuery::ListProposals {
+                start_after: Some(cursor),
+                limit,
+            },
+        )?;
+        let full = page.proposals.len() as u64 == limit;
+        for record in page.proposals {
+            require(record.id == cursor + 1, "proposal history gap")?;
+            if record.proposal.start_height > boundary.height {
+                break 'tail;
+            }
+            require(
+                cursor - boundary.proposal_count < MAX_PROPOSALS_TO_CHECK,
+                "too many proposals created at the boundary height",
+            )?;
+            cursor = record.id;
+            if stays_gated(
+                deps.as_ref(),
+                record.id,
+                &record.proposal.status,
+                &response.messages,
+            )? {
+                gated.push(record.id);
+            }
+        }
+        if !full {
+            break;
+        }
+        limit = PROPOSALS_PER_QUERY;
+    }
+    require(
+        gated.len() <= MAX_GATED,
+        "too many unresolved proposals to block",
     )?;
-    if let Some(first) = page.proposals.first() {
-        require(
-            first.proposal.start_height > boundary.height,
-            "proposal created at adoption height; governance review required",
+    if gated != stored {
+        GATED.save(deps.storage, &gated)?;
+    }
+    if cursor != boundary.proposal_count {
+        BOUNDARY.save(
+            deps.storage,
+            &SnapshotBoundary {
+                height: boundary.height,
+                proposal_count: cursor,
+            },
         )?;
     }
-    Ok(())
+    Ok(guard_pinned_config(response))
+}
+
+/// Ask for a reply once the last dispatched message, and so every message of
+/// the proposal, has completed. The reply rejects the whole execution if it
+/// left the configuration that governance membership actions depend on changed.
+///
+/// This covers actions dispatched through the proposal hook. It cannot stop an
+/// out-of-band path, such as an authz grant made by the DAO and used later.
+#[cfg(feature = "phoenix-rotation")]
+fn guard_pinned_config(mut response: Response) -> Response {
+    if let Some(last) = response.messages.last_mut() {
+        last.id = GUARD_REPLY_ID;
+        last.reply_on = cosmwasm_std::ReplyOn::Success;
+    }
+    response
+}
+
+#[cfg(not(feature = "phoenix-rotation"))]
+fn guard_pinned_config(response: Response) -> Response {
+    response
+}
+
+/// Handle the reply requested by the execution hook, if `id` is that reply.
+#[cfg(feature = "phoenix-rotation")]
+pub(crate) fn guard_reply(deps: Deps, env: &Env, id: u64) -> StdResult<Option<Response>> {
+    if id != GUARD_REPLY_ID {
+        return Ok(None);
+    }
+    rotation::check_membership_binding(deps, env)?;
+    require(
+        ADMIN.load(deps.storage)?.as_str() == CORE
+            && NOMINATED_ADMIN.may_load(deps.storage)?.is_none(),
+        "core admin or nomination changed",
+    )?;
+    Ok(Some(Response::new()))
+}
+
+#[cfg(not(feature = "phoenix-rotation"))]
+pub(crate) fn guard_reply(_deps: Deps, _env: &Env, _id: u64) -> StdResult<Option<Response>> {
+    Ok(None)
 }
 
 /// Adopts the unmigrated upstream 2.4.0 core, once. The default and governance
@@ -380,7 +593,7 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
             && voting.power == Uint128::from(expected_members.len() as u64 * SEAT_WEIGHT),
         "unexpected voting power",
     )?;
-    check_drained_proposals(deps.as_ref(), 0, expected_proposal_count)?;
+    let boundary = plan_boundary(deps.as_ref(), 0, expected_proposal_count)?;
     let mut changes = vec![MemberChange::Remove {
         address: outgoing.clone(),
     }];
@@ -432,13 +645,7 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
         .collect();
     let (membership, director_count) =
         governance::plan_membership(deps.as_ref(), previous, changes, seat.as_ref())?;
-    BOUNDARY.save(
-        deps.storage,
-        &SnapshotBoundary {
-            height: env.block.height,
-            proposal_count: expected_proposal_count,
-        },
-    )?;
+    let gated = boundary.save(deps.storage, env.block.height)?;
     if let Some(seat) = seat {
         governance::SEAT.save(deps.storage, &seat)?;
     }
@@ -447,7 +654,7 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
         threshold: YES_WEIGHT,
     };
     let response = contract::migrate(deps, env, UpstreamMigrate::FromCompatible {})?;
-    let response = response
+    let response = gated_attribute(response, &gated)
         .add_message(WasmMsg::Execute {
             contract_addr: GROUP.to_string(),
             msg: to_json_binary(&membership)?,

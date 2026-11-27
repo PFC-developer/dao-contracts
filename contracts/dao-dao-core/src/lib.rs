@@ -2,6 +2,7 @@
 
 pub mod contract;
 mod error;
+pub mod phoenix;
 pub mod state;
 
 #[cfg(test)]

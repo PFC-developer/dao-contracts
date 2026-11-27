@@ -29,7 +29,11 @@ use crate::state::{
 };
 
 pub(crate) const CONTRACT_NAME: &str = "crates.io:dao-dao-core";
-pub(crate) const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(not(feature = "phoenix-rotation"))]
+pub(crate) const CONTRACT_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-phoenix.4856.2");
+#[cfg(feature = "phoenix-rotation")]
+pub(crate) const CONTRACT_VERSION: &str =
+    concat!(env!("CARGO_PKG_VERSION"), "-phoenix.4856-governance");
 
 const PROPOSAL_MODULE_REPLY_ID: u64 = 0;
 const VOTE_MODULE_INSTANTIATE_REPLY_ID: u64 = 1;
@@ -136,7 +140,9 @@ pub fn execute(
             execute_admin_msgs(deps.as_ref(), info.sender, msgs)
         }
         ExecuteMsg::ExecuteProposalHook { msgs } => {
-            execute_proposal_hook(deps.as_ref(), info.sender, msgs)
+            let response = execute_proposal_hook(deps.as_ref(), info.sender, msgs)?;
+            crate::phoenix::check_snapshot_boundary(deps.as_ref(), &env)?;
+            Ok(response)
         }
         ExecuteMsg::Pause { duration } => execute_pause(deps, env, info.sender, duration),
         ExecuteMsg::Unpause {} => execute_unpause(deps, info.sender),
@@ -888,7 +894,7 @@ pub fn query_initial_actions(deps: Deps) -> StdResult<Binary> {
     to_json_binary(&INITIAL_ACTIONS.may_load(deps.storage)?.unwrap_or_default())
 }
 
-#[cfg_attr(not(feature = "library"), entry_point)]
+// The Phoenix entry point validates its predecessor before calling this helper.
 pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, ContractError> {
     let ContractVersion { version, .. } = get_contract_version(deps.storage)?;
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;

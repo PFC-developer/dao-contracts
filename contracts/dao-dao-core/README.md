@@ -81,3 +81,16 @@ pub enum ExecuteMsg {
 	// ...
 }
 ```
+
+## Phoenix adoption builds
+
+This crate builds in two forms. The default build adopts the deployed
+2.4.0 core. The build with the `phoenix-rotation` feature does the same
+and adds the host-authorized governance controls: the `sudo` membership
+actions, the governance seat and delayed send-as-DAO.
+
+The two builds are alternatives. Each one's `migrate` accepts only the
+unmigrated upstream 2.4.0 core, and runs once. A core adopted with the
+default build cannot migrate to the governance build, so choose the
+build before adoption. Adding the controls to an adopted core needs a
+new build that is reviewed separately.

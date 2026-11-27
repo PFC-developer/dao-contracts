@@ -13,7 +13,11 @@ use dao_voting::threshold::PercentageThreshold;
 
 use super::*;
 
+type ExtraQueries = Box<dyn Fn(&WasmQuery) -> Option<Binary>>;
+
 struct Host {
+    /// Answers queries for contracts outside the base fixture, such as a governance seat.
+    extra: Option<ExtraQueries>,
     members: Vec<Member>,
     old_code: u64,
     core_admin: String,
@@ -80,6 +84,7 @@ fn fixture(
         governance: None,
     };
     let host = Rc::new(RefCell::new(Host {
+        extra: None,
         members: addresses
             .into_iter()
             .map(|addr| Member { addr, weight: 25 })
@@ -103,6 +108,9 @@ fn fixture(
     let height = env.block.height;
     deps.querier.update_wasm(move |query| {
         let h = querier_host.borrow();
+        if let Some(answer) = h.extra.as_ref().and_then(|extra| extra(query)) {
+            return SystemResult::Ok(ContractResult::Ok(answer));
+        }
         let response = match query {
             WasmQuery::ContractInfo { contract_addr } => {
                 let mut info = ContractInfoResponse::default();
@@ -425,6 +433,7 @@ fn migration_options_keep_admin_and_delay_send() {
         migration_admin: MigrationAdmin::KeepCurrentAdmin,
         allow_send_as_dao: true,
         seat: None,
+        seat_veto_only: false,
         membership_changes: vec![MemberChange::Reweight {
             address: "fixture-member-1".to_owned(),
             weight: 26,
@@ -539,3 +548,5 @@ fn sudo_rotation_updates_exactly_one_equal_weight_seat_even_while_paused() {
         }
     );
 }
+
+mod controls;

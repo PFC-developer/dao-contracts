@@ -46,6 +46,12 @@ const PROPOSALS_PER_QUERY: u64 = 12;
 
 const BOUNDARY: Item<SnapshotBoundary> = Item::new("phoenix_snapshot_boundary_v1");
 
+/// This contract is built in two forms: the default build, and the build with
+/// the `phoenix-rotation` feature, which adds the host-authorized governance
+/// controls. They are alternative adoption targets. Each accepts only the
+/// unmigrated upstream 2.4.0 core as its predecessor, so a core adopted with
+/// the default build cannot migrate to the governance build. Adding the
+/// controls later needs a new, separately reviewed build.
 #[cw_serde]
 pub enum MigrateMsg {
     AdoptPhoenix4856 {
@@ -310,6 +316,8 @@ pub(crate) fn check_snapshot_boundary(deps: Deps, env: &Env) -> StdResult<()> {
     Ok(())
 }
 
+/// Adopts the unmigrated upstream 2.4.0 core, once. The default and governance
+/// builds do not accept each other as a predecessor; see [`MigrateMsg`].
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, ContractError> {
     check_binding(deps.as_ref(), &env)?;
@@ -381,12 +389,22 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
     let mut seat = None;
     if let Some(opts) = governance {
         require(
-            cfg!(feature = "phoenix-rotation") || (opts.seat.is_none() && !opts.allow_send_as_dao),
+            cfg!(feature = "phoenix-rotation")
+                || (opts.seat.is_none() && !opts.seat_veto_only && !opts.allow_send_as_dao),
             "standing governance controls are not enabled in this build",
         )?;
         transfer_admin = opts.migration_admin == MigrationAdmin::GovernanceOnly;
         allow_send = opts.allow_send_as_dao;
         changes.extend(opts.membership_changes);
+        require(
+            !opts.seat_veto_only
+                || opts
+                    .seat
+                    .as_ref()
+                    .zip(opts.veto.as_ref())
+                    .is_some_and(|(seat, veto)| seat.address == veto.vetoer),
+            "a veto-only seat must be the configured vetoer",
+        )?;
         if let Some(veto) = opts.veto {
             require(
                 veto.vetoer == GOV || opts.seat.as_ref().is_some_and(|s| s.address == veto.vetoer),
@@ -396,10 +414,14 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
         }
         if let Some(approved) = opts.seat {
             governance::check_seat(deps.as_ref(), &approved)?;
-            changes.push(MemberChange::Add {
-                address: approved.address.clone(),
-                weight: SEAT_WEIGHT,
-            });
+            // A veto-only seat is recorded but holds no ballot. A later
+            // membership action can seat it.
+            if !opts.seat_veto_only {
+                changes.push(MemberChange::Add {
+                    address: approved.address.clone(),
+                    weight: SEAT_WEIGHT,
+                });
+            }
             seat = Some(approved);
         }
     }

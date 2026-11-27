@@ -30,6 +30,10 @@ pub struct GovernanceOptions {
     pub allow_send_as_dao: bool,
     /// An optional, reviewed governance voting proxy.
     pub seat: Option<GovernanceSeat>,
+    /// Record the seat as the proposal vetoer without adding it to the group.
+    /// Requires `seat` and a `veto` whose vetoer is the seat.
+    #[serde(default)]
+    pub seat_veto_only: bool,
     /// Additional membership changes applied together with the required removal.
     #[serde(default)]
     pub membership_changes: Vec<MemberChange>,
@@ -108,6 +112,58 @@ pub(super) fn set_send_enabled(
     Ok(Response::new()
         .add_attribute("action", "schedule_governance_send")
         .add_attribute("active_at", active_at.seconds().to_string()))
+}
+
+#[cfg(feature = "phoenix-rotation")]
+fn is_group_member(deps: Deps, address: &str) -> StdResult<bool> {
+    let member: MemberResponse = deps.querier.query_wasm_smart(
+        GROUP,
+        &Cw4QueryMsg::Member {
+            addr: address.to_owned(),
+            at_height: None,
+        },
+    )?;
+    Ok(member.weight.is_some())
+}
+
+/// Re-approve the stored seat after its code changes, or replace or clear a
+/// seat that holds no group membership. Seating and unseating stay with the
+/// membership actions, so a seat address can never be left counted as a director.
+#[cfg(feature = "phoenix-rotation")]
+pub(super) fn set_seat(deps: DepsMut, seat: Option<GovernanceSeat>) -> StdResult<Response> {
+    let current = SEAT.may_load(deps.storage)?;
+    let Some(seat) = seat else {
+        let current =
+            current.ok_or_else(|| StdError::generic_err("no governance seat is stored"))?;
+        require(
+            !is_group_member(deps.as_ref(), &current.address)?,
+            "remove the governance seat from the group before clearing it",
+        )?;
+        SEAT.remove(deps.storage);
+        return Ok(Response::new()
+            .add_attribute("action", "clear_governance_seat")
+            .add_attribute("seat", current.address));
+    };
+    let seat = GovernanceSeat {
+        address: deps.api.addr_validate(&seat.address)?.into_string(),
+        code_id: seat.code_id,
+    };
+    check_seat(deps.as_ref(), &seat)?;
+    if current.as_ref().map(|c| c.address.as_str()) != Some(seat.address.as_str()) {
+        let previous_seated = match &current {
+            Some(current) => is_group_member(deps.as_ref(), &current.address)?,
+            None => false,
+        };
+        require(
+            !previous_seated && !is_group_member(deps.as_ref(), &seat.address)?,
+            "the seat address can change only while neither address is a group member",
+        )?;
+    }
+    SEAT.save(deps.storage, &seat)?;
+    Ok(Response::new()
+        .add_attribute("action", "set_governance_seat")
+        .add_attribute("seat", seat.address)
+        .add_attribute("code_id", seat.code_id.to_string()))
 }
 
 #[cfg(feature = "phoenix-rotation")]
@@ -237,21 +293,32 @@ pub(super) fn plan_membership(
         .map(|(_, &weight)| u128::from(weight))
         .collect();
     directors.sort_unstable_by(|a, b| b.cmp(a));
-    require(
-        matches!(directors.len(), 3..=5),
-        "expected three to five directors",
-    )?;
+    // The seat contract serves four or five members in total, itself included.
+    if chain_seated {
+        require(
+            matches!(directors.len(), 3..=4),
+            "expected three or four directors alongside the governance seat",
+        )?;
+    } else {
+        require(
+            matches!(directors.len(), 3..=5),
+            "expected three to five directors",
+        )?;
+    }
     require(
         directors[0] + directors[1] < YES_WEIGHT.u128()
             && directors.iter().sum::<u128>() >= YES_WEIGHT.u128()
             && roster.values().map(|&w| u128::from(w)).sum::<u128>() <= u128::from(u64::MAX),
         "weights must make the threshold reachable and require three directors",
     )?;
-    if chain_seated {
+    if let Some(seat) = seat.filter(|_| chain_seated) {
         require(
             roster.values().all(|&w| w == SEAT_WEIGHT),
             "governance tie-breaking requires equal seat weights",
         )?;
+        // Only a seat that stays in the roster needs a current approval.
+        // A seat whose code or admin has changed can still be removed.
+        check_seat(deps, seat)?;
     }
     Ok((GroupExecute::UpdateMembers { add, remove }, directors.len()))
 }

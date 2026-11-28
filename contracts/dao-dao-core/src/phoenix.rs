@@ -25,6 +25,8 @@ use crate::{
 
 mod governance;
 #[cfg(feature = "phoenix-rotation")]
+mod host;
+#[cfg(feature = "phoenix-rotation")]
 mod rotation;
 pub use governance::{GovernanceOptions, GovernanceSeat, MemberChange, MigrationAdmin};
 #[cfg(test)]
@@ -145,6 +147,10 @@ struct ProposalSnapshot {
     threshold: Threshold,
     #[cfg(feature = "phoenix-rotation")]
     veto: Option<VetoConfig>,
+    #[cfg(feature = "phoenix-rotation")]
+    allow_revoting: bool,
+    #[cfg(feature = "phoenix-rotation")]
+    expiration: cw_utils::Expiration,
 }
 
 // Decoded only for a proposal the module reports as executed.
@@ -179,6 +185,8 @@ struct PendingHistory {
 struct GuardedBatch {
     proposal_count: u64,
     veto: Option<VetoConfig>,
+    members: Vec<cw4::Member>,
+    seated_voting_period: Option<Duration>,
 }
 
 struct PlannedBoundary {
@@ -427,14 +435,14 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
             .is_some_and(|n| n <= MAX_PROPOSALS_TO_CHECK),
         "proposal count exceeds checked bound",
     )?;
-    // No proposal hook is running while a boundary is set through sudo, and no
-    // proposal is gated before adoption, so an executed entry here is settled.
+    // This runs outside proposal execution or after the executing proposal has
+    // passed the existing gate, so an executed gated entry is settled.
     let mut gated = keep_unresolved(deps, GATED.may_load(deps.storage)?.unwrap_or_default())?;
     let carried = gated.len();
     let mut gate = |id| -> StdResult<()> {
         require(
             id > reviewed,
-            format!("resolve legacy proposal {id} before adoption"),
+            format!("resolve legacy proposal {id} before changing membership"),
         )?;
         gated.push(id);
         Ok(())
@@ -515,13 +523,22 @@ fn stays_gated(deps: Deps, id: u64, status: &Status, hook: &[SubMsg]) -> StdResu
 /// was created at the boundary height after it. Other proposals execute
 /// normally. The source module assigns contiguous IDs in increasing chain
 /// height order.
-pub(crate) fn gate_execution(deps: DepsMut, env: &Env, response: Response) -> StdResult<Response> {
+pub(crate) fn gate_execution(
+    deps: DepsMut,
+    env: &Env,
+    sender: &Addr,
+    response: Response,
+) -> StdResult<Response> {
     let Some(boundary) = BOUNDARY.may_load(deps.storage)? else {
         return Ok(response);
     };
     require(
+        sender.as_str() == PROPOSAL,
+        "unexpected proposal hook sender",
+    )?;
+    require(
         env.block.height > boundary.height,
-        "proposal execution blocked at adoption height",
+        "proposal execution blocked at the membership boundary height",
     )?;
     let stored = GATED.may_load(deps.storage)?.unwrap_or_default();
     let mut gated = Vec::with_capacity(stored.len());
@@ -587,28 +604,57 @@ pub(crate) fn gate_execution(deps: DepsMut, env: &Env, response: Response) -> St
     guard_pinned_config(deps, response)
 }
 
+/// Admin calls can dispatch additional messages as the core during a proposal.
+#[cfg(feature = "phoenix-rotation")]
+pub(crate) fn guard_admin_messages(deps: Deps, response: Response) -> StdResult<Response> {
+    if GUARDED_BATCH.may_load(deps.storage)?.is_some() {
+        host::check_messages(&response)?;
+    }
+    Ok(response)
+}
+
+#[cfg(not(feature = "phoenix-rotation"))]
+pub(crate) fn guard_admin_messages(_deps: Deps, response: Response) -> StdResult<Response> {
+    Ok(response)
+}
+
 /// The outermost hook owns the reply and checks proposals created by nested
 /// calls too. All dispatched messages and their replies share the transaction.
 #[cfg(feature = "phoenix-rotation")]
 fn guard_pinned_config(deps: DepsMut, mut response: Response) -> StdResult<Response> {
-    let Some(last) = response.messages.last_mut() else {
+    if response.messages.is_empty() {
         return Ok(response);
-    };
-    if GUARDED_BATCH.may_load(deps.storage)?.is_none() {
-        let cfg: ProposalConfig = deps
-            .querier
-            .query_wasm_smart(PROPOSAL, &ProposalQuery::Config {})?;
-        let proposal_count = proposal_count(deps.as_ref())?;
-        GUARDED_BATCH.save(
-            deps.storage,
-            &GuardedBatch {
-                proposal_count,
-                veto: cfg.veto,
-            },
-        )?;
-        last.id = GUARD_REPLY_ID;
-        last.reply_on = cosmwasm_std::ReplyOn::Success;
     }
+    host::check_messages(&response)?;
+    let members = governance::current_members(deps.as_ref(), governance::MAX_REPAIR_MEMBERS)?;
+    if let Some(batch) = GUARDED_BATCH.may_load(deps.storage)? {
+        require(
+            members == batch.members,
+            "nested proposal execution blocked after membership changed",
+        )?;
+        return Ok(response);
+    }
+    let cfg: ProposalConfig = deps
+        .querier
+        .query_wasm_smart(PROPOSAL, &ProposalQuery::Config {})?;
+    let proposal_count = proposal_count(deps.as_ref())?;
+    let seated_voting_period =
+        governance::has_seat(deps.storage, &members)?.then_some(cfg.max_voting_period);
+    GUARDED_BATCH.save(
+        deps.storage,
+        &GuardedBatch {
+            proposal_count,
+            veto: cfg.veto,
+            members,
+            seated_voting_period,
+        },
+    )?;
+    let last = response
+        .messages
+        .last_mut()
+        .expect("checked nonempty response");
+    last.id = GUARD_REPLY_ID;
+    last.reply_on = cosmwasm_std::ReplyOn::Success;
     Ok(response)
 }
 
@@ -629,7 +675,17 @@ pub(crate) fn guard_reply(deps: DepsMut, env: &Env, id: u64) -> StdResult<Option
         cfg.veto == batch.veto,
         "proposal veto configuration changed",
     )?;
-    governance::check_current_roster(deps.as_ref())?;
+    let members = governance::check_current_roster(deps.as_ref())?;
+    require(
+        governance::has_seat(deps.storage, &members)? == batch.seated_voting_period.is_some(),
+        "changing governance seat membership requires governance",
+    )?;
+    if let Some(period) = batch.seated_voting_period {
+        require(
+            !cfg.allow_revoting && cfg.max_voting_period == period,
+            "proposal voting settings changed with a governance seat",
+        )?;
+    }
     require(
         ADMIN.load(deps.storage)?.as_str() == CORE
             && NOMINATED_ADMIN.may_load(deps.storage)?.is_none(),
@@ -649,10 +705,32 @@ pub(crate) fn guard_reply(deps: DepsMut, env: &Env, id: u64) -> StdResult<Option
                 "proposal {} saved different threshold or veto rules",
                 record.id
             ),
-        )
+        )?;
+        if let Some(period) = batch.seated_voting_period {
+            require(
+                !record.proposal.allow_revoting
+                    && record.proposal.expiration == period.after(&env.block),
+                format!("proposal {} saved different voting settings", record.id),
+            )?;
+        }
+        Ok(())
     })?;
+    let mut response = Response::new();
+    if members != batch.members {
+        let boundary = BOUNDARY.load(deps.storage)?;
+        let gated = plan_boundary(
+            deps.as_ref(),
+            boundary.proposal_count,
+            boundary.proposal_count,
+        )?
+        .save(deps.storage, env.block.height)?;
+        response = gated_attribute(
+            response.add_attribute("membership_boundary", env.block.height.to_string()),
+            &gated,
+        );
+    }
     GUARDED_BATCH.remove(deps.storage);
-    Ok(Some(Response::new()))
+    Ok(Some(response))
 }
 
 #[cfg(not(feature = "phoenix-rotation"))]
@@ -757,10 +835,11 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
             cfg.veto = Some(veto);
         }
         if let Some(approved) = opts.seat {
-            governance::check_seat(deps.as_ref(), &approved)?;
             // A veto-only seat is recorded but holds no ballot. A later
             // membership action can seat it.
-            if !opts.seat_veto_only {
+            if opts.seat_veto_only {
+                governance::check_seat(deps.as_ref(), &approved)?;
+            } else {
                 changes.push(MemberChange::Add {
                     address: approved.address.clone(),
                     weight: SEAT_WEIGHT,
@@ -774,8 +853,8 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
         .cloned()
         .map(|addr| (addr, SEAT_WEIGHT))
         .collect();
-    let (membership, director_count) =
-        governance::plan_membership(deps.as_ref(), previous, changes, seat.as_ref())?;
+    let membership = governance::plan_membership(deps.as_ref(), previous, changes, seat.as_ref())?;
+    governance::configure_voting_seat(&mut cfg, membership.response_blocks)?;
     let gated = boundary.save(deps.storage, env.block.height)?;
     if let Some(seat) = seat {
         governance::SEAT.save(deps.storage, &seat)?;
@@ -788,7 +867,7 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
     let response = gated_attribute(response, &gated)
         .add_message(WasmMsg::Execute {
             contract_addr: GROUP.to_string(),
-            msg: to_json_binary(&membership)?,
+            msg: to_json_binary(&membership.message)?,
             funds: vec![],
         })
         .add_message(WasmMsg::Execute {
@@ -798,7 +877,7 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
         })
         .add_attribute("action", "adopt_phoenix_4856")
         .add_attribute("removed", outgoing)
-        .add_attribute("remaining_seats", director_count.to_string())
+        .add_attribute("remaining_seats", membership.directors.to_string())
         .add_attribute("yes_weight_required", YES_WEIGHT)
         .add_attributes(
             send.attributes

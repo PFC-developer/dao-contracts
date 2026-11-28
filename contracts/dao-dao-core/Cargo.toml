@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 backtraces = ["cosmwasm-std/backtraces"]
 # use library feature to disable all instantiate/execute/query exports
 library = []
-phoenix-rotation = []
+phoenix-rotation = ["dep:osmosis-std"]
 
 [dependencies]
 cosmwasm-std = { workspace = true, features = ["ibc3"] }
@@ -34,6 +34,7 @@ serde = { workspace = true }
 dao-dao-macros = { workspace = true }
 cw-paginate-storage = { workspace = true }
 cw-core-v1 = { workspace = true, features = ["library"] }
+osmosis-std = { workspace = true, optional = true }
 
 [dev-dependencies]
 dao-dao-core = { workspace = true }

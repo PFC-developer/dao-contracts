@@ -39,7 +39,7 @@ pub enum SudoMsg {
 /// Wasmd's native governance handler is responsible for authorizing the call.
 /// This export deliberately does not share the ordinary core pause path.
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn sudo(mut deps: DepsMut, env: Env, msg: SudoMsg) -> Result<Response, ContractError> {
+pub fn sudo(deps: DepsMut, env: Env, msg: SudoMsg) -> Result<Response, ContractError> {
     governance::check_context(&env)?;
     let boundary = BOUNDARY.load(deps.storage)?;
     match msg {
@@ -86,26 +86,18 @@ pub fn sudo(mut deps: DepsMut, env: Env, msg: SudoMsg) -> Result<Response, Contr
             expected_proposal_count,
             changes,
         } => {
-            let restored = restore_membership_binding(deps.branch(), &env)?;
             let roster =
                 governance::reviewed_roster(deps.as_ref(), env.block.height, &expected_members)?;
             let seat = governance::SEAT.may_load(deps.storage)?;
-            let (membership, _) =
+            let membership =
                 governance::plan_membership(deps.as_ref(), roster, changes, seat.as_ref())?;
-            let response =
-                update_membership(deps, env, boundary, expected_proposal_count, membership)?;
-            Ok(with_restored(response, restored))
+            update_membership(deps, env, boundary, expected_proposal_count, membership)
         }
         SudoMsg::ReplaceBoardMember {
             outgoing,
             incoming,
             expected_weight,
-        } => {
-            let restored = restore_membership_binding(deps.branch(), &env)?;
-            let response =
-                replace_member(deps, env, boundary, outgoing, incoming, expected_weight)?;
-            Ok(with_restored(response, restored))
-        }
+        } => replace_member(deps, env, boundary, outgoing, incoming, expected_weight),
     }
 }
 
@@ -113,7 +105,11 @@ pub fn sudo(mut deps: DepsMut, env: Env, msg: SudoMsg) -> Result<Response, Contr
 /// ordinary proposal. Restore the ones this core controls and report them.
 /// Contract code, the group admin and the module's DAO cannot be restored
 /// from here, so a change to any of them still fails.
-fn restore_membership_binding(deps: DepsMut, env: &Env) -> StdResult<Response> {
+fn restore_membership_binding(
+    deps: DepsMut,
+    env: &Env,
+    response_blocks: Option<u64>,
+) -> StdResult<Response> {
     check_binding(deps.as_ref(), env)?;
     let primary = Addr::unchecked(PROPOSAL);
     let module = PROPOSAL_MODULES.may_load(deps.storage, primary.clone())?;
@@ -152,23 +148,23 @@ fn restore_membership_binding(deps: DepsMut, env: &Env) -> StdResult<Response> {
     let threshold = Threshold::AbsoluteCount {
         threshold: YES_WEIGHT,
     };
-    if cfg.threshold != threshold {
-        cfg.threshold = threshold;
-        response = response
-            .add_message(WasmMsg::Execute {
-                contract_addr: PROPOSAL.to_owned(),
-                msg: to_json_binary(&ProposalExecute::UpdateConfig(cfg))?,
-                funds: vec![],
-            })
-            .add_attribute("restored_threshold", YES_WEIGHT);
+    let previous = cfg.clone();
+    cfg.threshold = threshold;
+    governance::configure_voting_seat(&mut cfg, response_blocks)?;
+    if cfg.threshold != previous.threshold {
+        response = response.add_attribute("restored_threshold", YES_WEIGHT);
+    }
+    if cfg.allow_revoting != previous.allow_revoting {
+        response = response.add_attribute("disabled_revoting", "true");
+    }
+    if cfg != previous {
+        response = response.add_message(WasmMsg::Execute {
+            contract_addr: PROPOSAL.to_owned(),
+            msg: to_json_binary(&ProposalExecute::UpdateConfig(cfg))?,
+            funds: vec![],
+        });
     }
     Ok(response)
-}
-
-fn with_restored(response: Response, restored: Response) -> Response {
-    response
-        .add_submessages(restored.messages)
-        .add_attributes(restored.attributes)
 }
 
 pub(super) fn check_membership_binding(deps: Deps, env: &Env) -> StdResult<ProposalConfig> {
@@ -208,7 +204,7 @@ fn replace_member(
     )?;
     let seat = governance::SEAT.may_load(deps.storage)?;
     let roster = governance::reviewed_roster(deps.as_ref(), env.block.height, &roster)?;
-    let (membership, _) = governance::plan_membership(
+    let membership = governance::plan_membership(
         deps.as_ref(),
         roster,
         vec![
@@ -234,20 +230,23 @@ fn replace_member(
 }
 
 fn update_membership(
-    deps: DepsMut,
+    mut deps: DepsMut,
     env: Env,
     boundary: SnapshotBoundary,
     reviewed: u64,
-    membership: GroupExecute,
+    membership: governance::MembershipPlan,
 ) -> Result<Response, ContractError> {
+    let restored = restore_membership_binding(deps.branch(), &env, membership.response_blocks)?;
     let gated = plan_boundary(deps.as_ref(), boundary.proposal_count, reviewed)?
         .save(deps.storage, env.block.height)?;
     let response = Response::new()
         .add_message(WasmMsg::Execute {
             contract_addr: GROUP.to_owned(),
-            msg: to_json_binary(&membership)?,
+            msg: to_json_binary(&membership.message)?,
             funds: vec![],
         })
-        .add_attribute("action", "update_governance_membership");
+        .add_attribute("action", "update_governance_membership")
+        .add_submessages(restored.messages)
+        .add_attributes(restored.attributes);
     Ok(gated_attribute(response, &gated))
 }

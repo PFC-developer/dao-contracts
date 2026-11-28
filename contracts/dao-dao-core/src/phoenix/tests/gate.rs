@@ -60,6 +60,36 @@ fn hook_is_untouched_before_adoption() {
 }
 
 #[test]
+fn adopted_core_accepts_hooks_only_from_the_pinned_module() {
+    let ((mut deps, mut env, _), _) = adopted(&[]);
+    env.block.height += 1;
+    let other = Addr::unchecked("fixture-other-module");
+    PROPOSAL_MODULES
+        .save(
+            &mut deps.storage,
+            other.clone(),
+            &ProposalModule {
+                address: other.clone(),
+                prefix: "B".to_owned(),
+                status: ProposalModuleStatus::Enabled,
+            },
+        )
+        .unwrap();
+    let response = contract::execute(
+        deps.as_mut(),
+        env,
+        cosmwasm_std::testing::mock_info(other.as_str(), &[]),
+        dao_interface::msg::ExecuteMsg::ExecuteProposalHook {
+            msgs: fixture_msg("other module"),
+        },
+    );
+    assert!(response
+        .unwrap_err()
+        .to_string()
+        .contains("unexpected proposal hook sender"));
+}
+
+#[test]
 fn proposal_created_after_review_is_gated_instead_of_blocking_adoption() {
     let ((mut deps, mut env, host), response) = adopted(&[Status::Open]);
     assert_eq!(attribute(&response, "gated_proposals"), Some("2"));
@@ -452,6 +482,103 @@ fn finish_guard(deps: DepsMut, env: &Env) -> Result<Response, ContractError> {
         }),
     };
     contract::reply(deps, env.clone(), reply)
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn ordinary_roster_updates_gate_proposals_from_the_previous_roster() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    let open = push(&host, env.block.height, Status::Open);
+    env.block.height += 1;
+    let update = fixture_msg("membership change");
+    hook(deps.as_mut(), &env, &update).unwrap();
+    host.borrow_mut().members[0].addr = "fixture-next".to_owned();
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("nested proposal"))
+        .unwrap_err()
+        .to_string()
+        .contains("nested proposal execution blocked"));
+    let response = finish_guard(deps.as_mut(), &env).unwrap();
+    assert_eq!(attribute(&response, "gated_proposals"), Some("2"));
+    assert_eq!(gated(&deps), vec![open]);
+    assert_eq!(
+        BOUNDARY.load(&deps.storage).unwrap().height,
+        env.block.height
+    );
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("same block")).is_err());
+    env.block.height += 1;
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("next block")).is_ok());
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn ordinary_proposals_preserve_an_installed_seat_and_its_voting_rules() {
+    let (mut deps, mut env, host) = settled(&[]);
+    let seat = "fixture-voting-proxy".to_owned();
+    let member = Member {
+        addr: seat.clone(),
+        weight: SEAT_WEIGHT,
+    };
+    governance::SEAT
+        .save(
+            &mut deps.storage,
+            &GovernanceSeat {
+                address: seat,
+                code_id: 77,
+            },
+        )
+        .unwrap();
+    host.borrow_mut().members.push(member.clone());
+    env.block.height += 1;
+    hook(deps.as_mut(), &env, &fixture_msg("ordinary")).unwrap();
+    let original_period = host.borrow().config.max_voting_period;
+    host.borrow_mut().members.pop();
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("changing governance seat membership requires governance"));
+    host.borrow_mut().members.push(member);
+    host.borrow_mut().config.allow_revoting = true;
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("voting settings changed"));
+    host.borrow_mut().config.allow_revoting = false;
+    host.borrow_mut().config.max_voting_period = Duration::Height(1);
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("voting settings changed"));
+    host.borrow_mut().config.max_voting_period = original_period;
+
+    push(&host, env.block.height, Status::Open);
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("saved different voting settings"));
+    host.borrow_mut()
+        .proposals
+        .last_mut()
+        .unwrap()
+        .proposal
+        .expiration = original_period.after(&env.block);
+    host.borrow_mut()
+        .proposals
+        .last_mut()
+        .unwrap()
+        .proposal
+        .allow_revoting = true;
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("saved different voting settings"));
+    host.borrow_mut()
+        .proposals
+        .last_mut()
+        .unwrap()
+        .proposal
+        .allow_revoting = false;
+    assert_eq!(finish_guard(deps.as_mut(), &env).unwrap(), Response::new());
 }
 
 #[cfg(feature = "phoenix-rotation")]

@@ -137,11 +137,20 @@ pub fn execute(
 
     match msg {
         ExecuteMsg::ExecuteAdminMsgs { msgs } => {
-            execute_admin_msgs(deps.as_ref(), info.sender, msgs)
+            let response = execute_admin_msgs(deps.as_ref(), info.sender, msgs)?;
+            Ok(crate::phoenix::guard_admin_messages(
+                deps.as_ref(),
+                response,
+            )?)
         }
         ExecuteMsg::ExecuteProposalHook { msgs } => {
-            let response = execute_proposal_hook(deps.as_ref(), info.sender, msgs)?;
-            Ok(crate::phoenix::gate_execution(deps, &env, response)?)
+            let response = execute_proposal_hook(deps.as_ref(), info.sender.clone(), msgs)?;
+            Ok(crate::phoenix::gate_execution(
+                deps,
+                &env,
+                &info.sender,
+                response,
+            )?)
         }
         ExecuteMsg::Pause { duration } => execute_pause(deps, env, info.sender, duration),
         ExecuteMsg::Unpause {} => execute_unpause(deps, info.sender),

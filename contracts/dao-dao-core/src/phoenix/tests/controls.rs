@@ -14,6 +14,7 @@ struct SeatConfigFixture {
     group: String,
     proposal_module: String,
     seat_weight: u64,
+    response_blocks: u64,
 }
 
 /// Serve contract info and the bound config for the fixture seat contracts.
@@ -33,6 +34,7 @@ fn install_seats(host: &Rc<RefCell<Host>>) -> Rc<RefCell<u64>> {
                 group: GROUP.to_owned(),
                 proposal_module: PROPOSAL.to_owned(),
                 seat_weight: SEAT_WEIGHT,
+                response_blocks: 6,
             })
             .unwrap(),
         ),
@@ -455,6 +457,42 @@ fn adoption_refuses_five_directors_with_a_seated_seat() {
         .unwrap_err()
         .to_string()
         .contains("three or four directors"));
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn adoption_configures_voting_rules_for_a_governance_seat() {
+    for period in [6, 7] {
+        let (mut deps, env, host, mut payload) = fixture(4);
+        install_seats(&host);
+        let config = {
+            let mut h = host.borrow_mut();
+            h.config.allow_revoting = true;
+            h.config.max_voting_period = Duration::Height(period);
+            h.config.clone()
+        };
+        let MigrateMsg::AdoptPhoenix4856 {
+            expected_proposal_config,
+            ..
+        } = &mut payload;
+        *expected_proposal_config = config;
+        with_options(&mut payload, options(Some(seat(SEAT_CODE))));
+        let result = migrate(deps.as_mut(), env, payload);
+        if period == 6 {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("must outlast governance response window"));
+        } else {
+            let response = result.unwrap();
+            let CosmosMsg::Wasm(WasmMsg::Execute { msg, .. }) = &response.messages[1].msg else {
+                panic!("expected configuration update");
+            };
+            let ProposalExecute::UpdateConfig(config) = from_json(msg).unwrap();
+            assert!(!config.allow_revoting);
+            assert_eq!(config.max_voting_period, Duration::Height(7));
+        }
+    }
 }
 
 #[cfg(feature = "phoenix-rotation")]

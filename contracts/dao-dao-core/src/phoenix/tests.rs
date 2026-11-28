@@ -47,6 +47,10 @@ struct FullProposal<'a> {
     threshold: &'a Threshold,
     #[cfg(feature = "phoenix-rotation")]
     veto: &'a Option<VetoConfig>,
+    #[cfg(feature = "phoenix-rotation")]
+    allow_revoting: bool,
+    #[cfg(feature = "phoenix-rotation")]
+    expiration: cw_utils::Expiration,
 }
 
 fn snapshot(start_height: u64, status: Status) -> ProposalSnapshot {
@@ -59,6 +63,10 @@ fn snapshot(start_height: u64, status: Status) -> ProposalSnapshot {
         },
         #[cfg(feature = "phoenix-rotation")]
         veto: None,
+        #[cfg(feature = "phoenix-rotation")]
+        allow_revoting: false,
+        #[cfg(feature = "phoenix-rotation")]
+        expiration: cw_utils::Expiration::Never {},
     }
 }
 
@@ -229,6 +237,10 @@ fn fixture(
                                 threshold: &record.proposal.threshold,
                                 #[cfg(feature = "phoenix-rotation")]
                                 veto: &record.proposal.veto,
+                                #[cfg(feature = "phoenix-rotation")]
+                                allow_revoting: record.proposal.allow_revoting,
+                                #[cfg(feature = "phoenix-rotation")]
+                                expiration: record.proposal.expiration,
                             },
                         })
                     }
@@ -381,7 +393,12 @@ fn rejects_actionable_legacy_and_changed_proposal_count() {
 }
 
 fn hook(deps: DepsMut, env: &Env, msgs: &[CosmosMsg]) -> StdResult<Response> {
-    gate_execution(deps, env, Response::new().add_messages(msgs.to_vec()))
+    gate_execution(
+        deps,
+        env,
+        &Addr::unchecked(PROPOSAL),
+        Response::new().add_messages(msgs.to_vec()),
+    )
 }
 
 fn fixture_msg(tag: &str) -> Vec<CosmosMsg> {
@@ -438,7 +455,7 @@ fn scans_all_pages_through_the_reviewed_proposal_count() {
 
 #[test]
 fn snapshot_projection_accepts_full_child_proposal_fields() {
-    let response = br#"{"proposals":[{"id":7,"proposal":{"title":"Fixture","description":"Ignored","start_height":20,"status":"open","msgs":[],"total_power":"100","threshold":{"absolute_count":{"threshold":"75"}}}}]}"#;
+    let response = br#"{"proposals":[{"id":7,"proposal":{"title":"Fixture","description":"Ignored","start_height":20,"status":"open","msgs":[],"total_power":"100","threshold":{"absolute_count":{"threshold":"75"}},"allow_revoting":false,"expiration":{"at_height":36}}}]}"#;
     let result: ProposalList = from_json(response).unwrap();
     assert_eq!(result.proposals[0].id, 7);
     assert_eq!(result.proposals[0].proposal.start_height, 20);

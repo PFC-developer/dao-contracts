@@ -89,6 +89,17 @@ This crate builds in two forms. The default build adopts the deployed
 and adds the host-authorized governance controls: the `sudo` membership
 actions, the governance seat and delayed send-as-DAO.
 
+An ordinary proposal can change director membership within the roster
+limits. That establishes a new proposal snapshot boundary. Governance
+controls when the voting proxy joins or leaves. A seated voting proxy
+requires revoting to be disabled and protects the voting period from
+ordinary proposal changes. For a height-based voting period, the period
+must extend past the proxy's response window.
+
+The governance build reserves administration of its pinned voting, group,
+and proposal contracts for governance. Ordinary proposals can still dispatch
+messages to those contracts through their existing execute interfaces.
+
 The two builds are alternatives. Each one's `migrate` accepts only the
 unmigrated upstream 2.4.0 core, and runs once. A core adopted with the
 default build cannot migrate to the governance build, so choose the

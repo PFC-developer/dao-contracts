@@ -10,7 +10,7 @@ const SEND_DELAY_SECONDS: u64 = 48 * 60 * 60;
 pub(super) const MAX_MEMBERS: usize = 5;
 const MAX_MEMBERSHIP_CHANGES: usize = 12;
 #[cfg(feature = "phoenix-rotation")]
-const MAX_REPAIR_MEMBERS: usize = MAX_MEMBERS + MAX_MEMBERSHIP_CHANGES;
+pub(super) const MAX_REPAIR_MEMBERS: usize = MAX_MEMBERS + MAX_MEMBERSHIP_CHANGES;
 const SEND_ACTIVE_AT: Item<Timestamp> = Item::new("governance_send_active_at");
 pub(super) const SEAT: Item<GovernanceSeat> = Item::new("governance_seat");
 
@@ -58,6 +58,7 @@ struct SeatConfig {
     group: String,
     proposal_module: String,
     seat_weight: u64,
+    response_blocks: u64,
 }
 
 #[cw_serde]
@@ -65,7 +66,7 @@ enum SeatQuery {
     Config {},
 }
 
-pub(super) fn check_seat(deps: Deps, seat: &GovernanceSeat) -> StdResult<()> {
+pub(super) fn check_seat(deps: Deps, seat: &GovernanceSeat) -> StdResult<u64> {
     let address = deps.api.addr_validate(&seat.address)?;
     require(
         address.as_str() != CORE && address.as_str() != GOV,
@@ -84,9 +85,11 @@ pub(super) fn check_seat(deps: Deps, seat: &GovernanceSeat) -> StdResult<()> {
         cfg.dao == CORE
             && cfg.group == GROUP
             && cfg.proposal_module == PROPOSAL
-            && cfg.seat_weight == SEAT_WEIGHT,
+            && cfg.seat_weight == SEAT_WEIGHT
+            && cfg.response_blocks > 0,
         "unexpected governance seat binding",
-    )
+    )?;
+    Ok(cfg.response_blocks)
 }
 
 pub(super) fn check_context(env: &Env) -> StdResult<()> {
@@ -205,13 +208,21 @@ pub(super) fn current_members(deps: Deps, max_members: usize) -> StdResult<Vec<M
 }
 
 #[cfg(feature = "phoenix-rotation")]
-pub(super) fn check_current_roster(deps: Deps) -> StdResult<()> {
-    let roster = current_members(deps, MAX_MEMBERS)?
-        .into_iter()
-        .map(|member| (member.addr, member.weight))
+pub(super) fn check_current_roster(deps: Deps) -> StdResult<Vec<Member>> {
+    let members = current_members(deps, MAX_MEMBERS)?;
+    let roster = members
+        .iter()
+        .map(|member| (member.addr.clone(), member.weight))
         .collect();
     validate_roster(&roster, SEAT.may_load(deps.storage)?.as_ref())?;
-    Ok(())
+    Ok(members)
+}
+
+#[cfg(feature = "phoenix-rotation")]
+pub(super) fn has_seat(storage: &dyn Storage, members: &[Member]) -> StdResult<bool> {
+    Ok(SEAT
+        .may_load(storage)?
+        .is_some_and(|seat| members.iter().any(|member| member.addr == seat.address)))
 }
 
 #[cfg(feature = "phoenix-rotation")]
@@ -263,12 +274,36 @@ pub(super) fn reviewed_roster(
     Ok(roster)
 }
 
+pub(super) struct MembershipPlan {
+    pub message: GroupExecute,
+    pub directors: usize,
+    pub response_blocks: Option<u64>,
+}
+
+pub(super) fn configure_voting_seat(
+    cfg: &mut ProposalConfig,
+    response_blocks: Option<u64>,
+) -> StdResult<()> {
+    if let Some(response_blocks) = response_blocks {
+        // For height-based proposals the response window must end before the
+        // last voting block. Time-based periods depend on actual block times.
+        if let Duration::Height(voting_blocks) = cfg.max_voting_period {
+            require(
+                voting_blocks > response_blocks,
+                "voting period must outlast governance response window",
+            )?;
+        }
+        cfg.allow_revoting = false;
+    }
+    Ok(())
+}
+
 pub(super) fn plan_membership(
     deps: Deps,
     mut roster: BTreeMap<String, u64>,
     changes: Vec<MemberChange>,
     seat: Option<&GovernanceSeat>,
-) -> StdResult<(GroupExecute, usize)> {
+) -> StdResult<MembershipPlan> {
     require(
         (1..=MAX_MEMBERSHIP_CHANGES).contains(&changes.len()),
         "invalid membership change count",
@@ -311,12 +346,17 @@ pub(super) fn plan_membership(
             }
         }
     }
-    let director_count = validate_roster(&roster, seat)?;
+    let directors = validate_roster(&roster, seat)?;
     // A seat whose code or admin changed can still be removed.
-    if let Some(seat) = seat.filter(|seat| roster.contains_key(&seat.address)) {
-        check_seat(deps, seat)?;
-    }
-    Ok((GroupExecute::UpdateMembers { add, remove }, director_count))
+    let response_blocks = seat
+        .filter(|seat| roster.contains_key(&seat.address))
+        .map(|seat| check_seat(deps, seat))
+        .transpose()?;
+    Ok(MembershipPlan {
+        message: GroupExecute::UpdateMembers { add, remove },
+        directors,
+        response_blocks,
+    })
 }
 
 fn validate_roster(

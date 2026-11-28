@@ -1719,6 +1719,7 @@ dependencies = [
  "dao-testing",
  "dao-voting 2.7.1",
  "dao-voting-cw20-balance",
+ "osmosis-std",
  "serde",
  "thiserror",
 ]

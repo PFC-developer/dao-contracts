@@ -600,3 +600,47 @@ fn default_build_refuses_a_veto_only_seat() {
         .to_string()
         .contains("not enabled in this build"));
 }
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn reapproving_a_seated_seat_reapplies_its_voting_rules() {
+    let (mut deps, env, host, _) = adopted_with_seat(4);
+    let reapprove = SudoMsg::SetGovernanceSeat {
+        seat: Some(seat(SEAT_CODE)),
+    };
+
+    // The voting rules already fit the seat's response window.
+    let response = sudo(deps.as_mut(), env.clone(), reapprove.clone()).unwrap();
+    assert!(response.messages.is_empty());
+
+    // The fixture seat reports a six-block response window.
+    host.borrow_mut().config.max_voting_period = Duration::Height(6);
+    assert!(sudo(deps.as_mut(), env.clone(), reapprove.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("voting period must outlast governance response window"));
+
+    let mut h = host.borrow_mut();
+    h.config.max_voting_period = Duration::Height(7);
+    h.config.allow_revoting = true;
+    let mut expected = h.config.clone();
+    expected.allow_revoting = false;
+    drop(h);
+    let response = sudo(deps.as_mut(), env.clone(), reapprove.clone()).unwrap();
+    let CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr, msg, ..
+    }) = &response.messages[0].msg
+    else {
+        panic!("expected a proposal config update")
+    };
+    assert_eq!(contract_addr, PROPOSAL);
+    assert_eq!(
+        from_json::<ProposalExecute>(msg).unwrap(),
+        ProposalExecute::UpdateConfig(expected)
+    );
+
+    // A seat that holds no ballot does not constrain the voting rules.
+    host.borrow_mut().members.pop();
+    let response = sudo(deps.as_mut(), env, reapprove).unwrap();
+    assert!(response.messages.is_empty());
+}

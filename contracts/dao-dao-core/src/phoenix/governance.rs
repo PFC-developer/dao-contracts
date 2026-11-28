@@ -12,10 +12,21 @@ const MAX_MEMBERSHIP_CHANGES: usize = 12;
 #[cfg(feature = "phoenix-rotation")]
 pub(super) const MAX_REPAIR_MEMBERS: usize = MAX_MEMBERS + MAX_MEMBERSHIP_CHANGES;
 const SEND_ACTIVE_AT: Item<Timestamp> = Item::new("governance_send_active_at");
+/// The roster before a governance send, held until its last message completes.
+#[cfg(feature = "phoenix-rotation")]
+const SEND_ROSTER: Item<Vec<Member>> = Item::new("governance_send_roster");
+// The group returns at most this many members per page.
+#[cfg(feature = "phoenix-rotation")]
+const ROSTER_PAGE: u32 = 30;
 pub(super) const SEAT: Item<GovernanceSeat> = Item::new("governance_seat");
 
 #[cw_serde]
 pub enum MigrationAdmin {
+    /// The core stays its own host admin, so the DAO keeps upgrade authority.
+    /// An ordinary proposal can then migrate the core or reassign its admin,
+    /// which removes every governance control in this build. Those controls
+    /// are binding only once the admin is governance: choose `GovernanceOnly`,
+    /// or have governance call `SetMigrationAdmin` afterwards.
     KeepCurrentAdmin,
     GovernanceOnly,
 }
@@ -155,27 +166,64 @@ pub(super) fn set_seat(deps: DepsMut, seat: Option<GovernanceSeat>) -> StdResult
         address: deps.api.addr_validate(&seat.address)?.into_string(),
         code_id: seat.code_id,
     };
-    check_seat(deps.as_ref(), &seat)?;
+    let response_blocks = check_seat(deps.as_ref(), &seat)?;
+    let seated = is_group_member(deps.as_ref(), &seat.address)?;
     if current.as_ref().map(|c| c.address.as_str()) != Some(seat.address.as_str()) {
         let previous_seated = match &current {
             Some(current) => is_group_member(deps.as_ref(), &current.address)?,
             None => false,
         };
         require(
-            !previous_seated && !is_group_member(deps.as_ref(), &seat.address)?,
+            !previous_seated && !seated,
             "the seat address can change only while neither address is a group member",
         )?;
     }
     SEAT.save(deps.storage, &seat)?;
-    Ok(Response::new()
+    let mut response = Response::new()
         .add_attribute("action", "set_governance_seat")
         .add_attribute("seat", seat.address)
-        .add_attribute("code_id", seat.code_id.to_string()))
+        .add_attribute("code_id", seat.code_id.to_string());
+    // New seat code can report a different response window. A seated seat's
+    // window must still fit the voting rules it was seated under.
+    if seated {
+        let mut cfg: ProposalConfig = deps
+            .querier
+            .query_wasm_smart(PROPOSAL, &ProposalQuery::Config {})?;
+        require(cfg.dao == CORE, "proposal module DAO changed")?;
+        let previous = cfg.clone();
+        configure_voting_seat(&mut cfg, Some(response_blocks))?;
+        if cfg != previous {
+            response = response
+                .add_message(WasmMsg::Execute {
+                    contract_addr: PROPOSAL.to_owned(),
+                    msg: to_json_binary(&ProposalExecute::UpdateConfig(cfg))?,
+                    funds: vec![],
+                })
+                .add_attribute("disabled_revoting", "true");
+        }
+    }
+    Ok(response)
 }
 
+// The send path must work on a roster that needs repair, so this neither
+// validates the roster nor rejects an oversized one.
+#[cfg(feature = "phoenix-rotation")]
+fn roster_page(deps: Deps) -> StdResult<Vec<Member>> {
+    let roster: MemberListResponse = deps.querier.query_wasm_smart(
+        GROUP,
+        &Cw4QueryMsg::ListMembers {
+            start_after: None,
+            limit: Some(ROSTER_PAGE),
+        },
+    )?;
+    Ok(roster.members)
+}
+
+/// Dispatch governance's messages as the DAO. A reply after the last message
+/// sets a membership boundary if they changed the roster.
 #[cfg(feature = "phoenix-rotation")]
 pub(super) fn send_as_dao(
-    deps: Deps,
+    deps: DepsMut,
     now: Timestamp,
     msgs: Vec<CosmosMsg<Empty>>,
 ) -> StdResult<Response> {
@@ -186,9 +234,40 @@ pub(super) fn send_as_dao(
         "governance send is disabled or pending",
     )?;
     require(!msgs.is_empty(), "expected at least one message")?;
-    Ok(Response::new()
+    let roster = roster_page(deps.as_ref())?;
+    SEND_ROSTER.save(deps.storage, &roster)?;
+    let mut response = Response::new()
         .add_attribute("action", "governance_send")
-        .add_messages(msgs))
+        .add_messages(msgs);
+    let last = response
+        .messages
+        .last_mut()
+        .expect("checked nonempty messages");
+    last.id = SEND_REPLY_ID;
+    last.reply_on = cosmwasm_std::ReplyOn::Success;
+    Ok(response)
+}
+
+/// Runs after the last message of a governance send. Proposals that
+/// snapshotted the previous roster must not execute under a changed one.
+#[cfg(feature = "phoenix-rotation")]
+pub(super) fn send_reply(deps: DepsMut, env: &Env) -> StdResult<Response> {
+    let before = SEND_ROSTER.load(deps.storage)?;
+    SEND_ROSTER.remove(deps.storage);
+    if roster_page(deps.as_ref())? == before {
+        return Ok(Response::new());
+    }
+    let boundary = BOUNDARY.load(deps.storage)?;
+    let gated = plan_boundary(
+        deps.as_ref(),
+        boundary.proposal_count,
+        boundary.proposal_count,
+    )?
+    .save(deps.storage, env.block.height)?;
+    Ok(gated_attribute(
+        Response::new().add_attribute("membership_boundary", env.block.height.to_string()),
+        &gated,
+    ))
 }
 
 #[cfg(feature = "phoenix-rotation")]
@@ -225,12 +304,12 @@ pub(super) fn has_seat(storage: &dyn Storage, members: &[Member]) -> StdResult<b
         .is_some_and(|seat| members.iter().any(|member| member.addr == seat.address)))
 }
 
+/// The reviewed roster must be the current one. It is not compared with the
+/// block-start snapshot: every roster change sets a boundary at its own
+/// height, which already blocks the proposals that snapshot this block, and
+/// the comparison would make a second membership action in one block fail.
 #[cfg(feature = "phoenix-rotation")]
-pub(super) fn reviewed_roster(
-    deps: Deps,
-    height: u64,
-    expected: &[Member],
-) -> StdResult<BTreeMap<String, u64>> {
+pub(super) fn reviewed_roster(deps: Deps, expected: &[Member]) -> StdResult<BTreeMap<String, u64>> {
     require(
         expected.len() <= MAX_REPAIR_MEMBERS,
         "too many reviewed members",
@@ -251,26 +330,6 @@ pub(super) fn reviewed_roster(
                 .all(|m| roster.get(&m.addr) == Some(&m.weight)),
         "current roster or weights changed",
     )?;
-    let total: TotalWeightResponse = deps.querier.query_wasm_smart(
-        GROUP,
-        &Cw4QueryMsg::TotalWeight {
-            at_height: Some(height),
-        },
-    )?;
-    require(
-        u128::from(total.weight) == roster.values().map(|&w| u128::from(w)).sum(),
-        "block-start total changed",
-    )?;
-    for (addr, &weight) in &roster {
-        let member: MemberResponse = deps.querier.query_wasm_smart(
-            GROUP,
-            &Cw4QueryMsg::Member {
-                addr: addr.clone(),
-                at_height: Some(height),
-            },
-        )?;
-        require(member.weight == Some(weight), "block-start member changed")?;
-    }
     Ok(roster)
 }
 

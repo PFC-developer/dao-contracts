@@ -17,6 +17,11 @@ pub enum SudoMsg {
     },
     /// Classify up to 48 proposals toward the next membership change.
     /// Repeat until the reported cursor has caught up with the proposal count.
+    ///
+    /// A membership change scans at most 512 proposals created since the last
+    /// boundary or checkpoint. Past that, every membership change fails,
+    /// including a roster change made by an ordinary proposal, until
+    /// governance has checkpointed the backlog.
     CheckpointProposalHistory {},
     SetSendAsDao {
         enabled: bool,
@@ -31,6 +36,8 @@ pub enum SudoMsg {
     SetMigrationAdmin {
         admin: String,
     },
+    /// Dispatch messages as the DAO. If they change the group roster, a new
+    /// membership boundary blocks the proposals that were still unresolved.
     SendAsDao {
         messages: Vec<CosmosMsg<Empty>>,
     },
@@ -58,11 +65,9 @@ pub fn sudo(deps: DepsMut, env: Env, msg: SudoMsg) -> Result<Response, ContractE
             enabled,
         )?),
         SudoMsg::SetGovernanceSeat { seat } => Ok(governance::set_seat(deps, seat)?),
-        SudoMsg::SendAsDao { messages } => Ok(governance::send_as_dao(
-            deps.as_ref(),
-            env.block.time,
-            messages,
-        )?),
+        SudoMsg::SendAsDao { messages } => {
+            Ok(governance::send_as_dao(deps, env.block.time, messages)?)
+        }
         SudoMsg::SetMigrationAdmin { admin } => {
             let admin = deps.api.addr_validate(&admin)?.into_string();
             let current = deps.querier.query_wasm_contract_info(CORE)?.admin;
@@ -86,8 +91,7 @@ pub fn sudo(deps: DepsMut, env: Env, msg: SudoMsg) -> Result<Response, ContractE
             expected_proposal_count,
             changes,
         } => {
-            let roster =
-                governance::reviewed_roster(deps.as_ref(), env.block.height, &expected_members)?;
+            let roster = governance::reviewed_roster(deps.as_ref(), &expected_members)?;
             let seat = governance::SEAT.may_load(deps.storage)?;
             let membership =
                 governance::plan_membership(deps.as_ref(), roster, changes, seat.as_ref())?;
@@ -203,7 +207,7 @@ fn replace_member(
         "outgoing seat or expected weight changed",
     )?;
     let seat = governance::SEAT.may_load(deps.storage)?;
-    let roster = governance::reviewed_roster(deps.as_ref(), env.block.height, &roster)?;
+    let roster = governance::reviewed_roster(deps.as_ref(), &roster)?;
     let membership = governance::plan_membership(
         deps.as_ref(),
         roster,

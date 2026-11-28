@@ -27,8 +27,18 @@ struct Host {
     block_start_weight: Option<u64>,
     config: ProposalConfig,
     proposals: Vec<ProposalRecord>,
-    /// Messages of the proposals that carry any, by proposal ID.
+    /// Messages set for a proposal, by proposal ID. A proposal without an
+    /// entry carries its own distinct message, as real proposals do.
     messages: std::collections::BTreeMap<u64, Vec<CosmosMsg>>,
+    /// Hooks registered on the membership group.
+    hooks: Vec<String>,
+}
+
+fn proposal_msgs(host: &Host, id: u64) -> Vec<CosmosMsg> {
+    host.messages
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| fixture_msg(&format!("proposal-{id}")))
 }
 
 // The single-proposal query as the deployed module answers it, with messages.
@@ -42,7 +52,7 @@ struct FullRecord<'a> {
 struct FullProposal<'a> {
     start_height: u64,
     status: &'a Status,
-    msgs: &'a [CosmosMsg],
+    msgs: Vec<CosmosMsg>,
     #[cfg(feature = "phoenix-rotation")]
     threshold: &'a Threshold,
     #[cfg(feature = "phoenix-rotation")]
@@ -122,6 +132,7 @@ fn fixture(
         expected_proposal_config: config.clone(),
         expected_creation_policy: ProposalCreationPolicy::Anyone {},
         expected_proposal_count: 1,
+        expected_group_hooks: vec![],
         governance: None,
     };
     let host = Rc::new(RefCell::new(Host {
@@ -142,6 +153,7 @@ fn fixture(
             proposal: snapshot(env.block.height - 1, Status::Executed),
         }],
         messages: Default::default(),
+        hooks: vec![],
     }));
     let querier_host = host.clone();
     let height = env.block.height;
@@ -213,7 +225,9 @@ fn fixture(
                             }
                         }),
                     }),
-                    _ => panic!("unexpected group query"),
+                    Cw4QueryMsg::Hooks {} => to_json_binary(&HooksResponse {
+                        hooks: h.hooks.clone(),
+                    }),
                 },
                 PROPOSAL => match from_json::<ProposalQuery>(msg).unwrap() {
                     ProposalQuery::Config {} => to_json_binary(&h.config),
@@ -232,7 +246,7 @@ fn fixture(
                             proposal: FullProposal {
                                 start_height: record.proposal.start_height,
                                 status: &record.proposal.status,
-                                msgs: h.messages.get(&proposal_id).map_or(&[], Vec::as_slice),
+                                msgs: proposal_msgs(&h, proposal_id),
                                 #[cfg(feature = "phoenix-rotation")]
                                 threshold: &record.proposal.threshold,
                                 #[cfg(feature = "phoenix-rotation")]

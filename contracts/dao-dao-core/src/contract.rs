@@ -1017,9 +1017,15 @@ pub fn reply(mut deps: DepsMut, env: Env, msg: Reply) -> Result<Response, Contra
                 None => vec![],
             };
 
-            Ok(Response::default()
+            // A new module chooses these messages and the core dispatches
+            // them, so they get the same check as a proposal's own messages.
+            let response = Response::default()
                 .add_attribute("prop_module".to_string(), res.contract_address)
-                .add_messages(callback_msgs))
+                .add_messages(callback_msgs);
+            Ok(crate::phoenix::guard_admin_messages(
+                deps.as_ref(),
+                response,
+            )?)
         }
 
         VOTE_MODULE_INSTANTIATE_REPLY_ID => {

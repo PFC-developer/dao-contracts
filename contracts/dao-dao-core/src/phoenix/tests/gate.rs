@@ -24,8 +24,18 @@ fn set_msgs(host: &Rc<RefCell<Host>>, id: u64, msgs: &[CosmosMsg]) {
     host.borrow_mut().messages.insert(id, msgs.to_vec());
 }
 
+fn msgs_of(host: &Rc<RefCell<Host>>, id: u64) -> Vec<CosmosMsg> {
+    proposal_msgs(&host.borrow(), id)
+}
+
+// Every blocked proposal ID, whichever messages it is filed under.
 fn gated(deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>) -> Vec<u64> {
-    GATED.load(&deps.storage).unwrap()
+    let mut ids: Vec<u64> = GATED
+        .range(&deps.storage, None, None, Order::Ascending)
+        .flat_map(|entry| entry.unwrap().1)
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 fn cursor(deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>) -> u64 {
@@ -56,7 +66,7 @@ fn hook_is_untouched_before_adoption() {
     let msgs = fixture_msg("early");
     let response = hook(deps.as_mut(), &env, &msgs).unwrap();
     assert_eq!(response, Response::new().add_messages(msgs));
-    assert!(GATED.may_load(&deps.storage).unwrap().is_none());
+    assert!(gated(&deps).is_empty());
 }
 
 #[test]
@@ -107,8 +117,7 @@ fn proposal_created_after_review_is_gated_instead_of_blocking_adoption() {
     assert_eq!(gated(&deps), vec![2]);
 
     // The gated proposal's own execution is refused.
-    let stale = fixture_msg("stale");
-    set_msgs(&host, 2, &stale);
+    let stale = msgs_of(&host, 2);
     set_status(&host, 2, Status::Executed);
     assert!(hook(deps.as_mut(), &env, &stale)
         .unwrap_err()
@@ -116,11 +125,14 @@ fn proposal_created_after_review_is_gated_instead_of_blocking_adoption() {
         .contains("proposal 2 predates the current membership"));
     assert_eq!(gated(&deps), vec![2]);
 
-    // The module records the failure, and the entry is pruned.
+    // The module records the failure. Other proposals are unaffected, and a
+    // new proposal carrying the same messages executes and drops the entry.
     set_status(&host, 2, Status::ExecutionFailed);
     assert!(hook(deps.as_mut(), &env, &later).is_ok());
+    assert_eq!(gated(&deps), vec![2]);
+    assert!(hook(deps.as_mut(), &env, &stale).is_ok());
     assert!(gated(&deps).is_empty());
-    assert!(hook(deps.as_mut(), &env, &later).is_ok());
+    assert!(hook(deps.as_mut(), &env, &stale).is_ok());
 }
 
 #[test]
@@ -132,14 +144,12 @@ fn adoption_without_unresolved_proposals_reports_none() {
 }
 
 #[test]
-fn settled_gated_proposals_are_pruned() {
+fn settled_gated_proposals_are_dropped_by_a_proposal_with_the_same_messages() {
     for status in [
         Status::Rejected,
         Status::Closed,
         Status::ExecutionFailed,
         Status::Vetoed,
-        // v2.4.0 marks a proposal with no messages executed without calling the core.
-        Status::Executed,
     ] {
         let ((mut deps, mut env, host), _) = adopted(&[
             Status::Open,
@@ -150,18 +160,39 @@ fn settled_gated_proposals_are_pruned() {
         assert_eq!(gated(&deps), vec![2, 3]);
         env.block.height += 1;
         set_status(&host, 2, status);
+        // An execution reads only the entry for its own messages.
         assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+        assert_eq!(gated(&deps), vec![2, 3]);
+        assert!(hook(deps.as_mut(), &env, &msgs_of(&host, 2)).is_ok());
         assert_eq!(gated(&deps), vec![3]);
     }
 }
 
 #[test]
-fn executed_gated_proposal_with_other_messages_does_not_freeze_execution() {
+fn proposal_without_messages_is_reported_but_never_filed() {
+    // v2.4.0 marks a proposal with no messages executed without calling the core.
+    let (mut deps, env, host, payload) = fixture(4);
+    let empty = push(&host, env.block.height - 1, Status::Open);
+    set_msgs(&host, empty, &[]);
+    let response = migrate(deps.as_mut(), env.clone(), payload).unwrap();
+    assert_eq!(attribute(&response, "gated_proposals"), Some("2"));
+    assert!(gated(&deps).is_empty());
+    let mut env = env;
+    env.block.height += 1;
+    set_status(&host, empty, Status::Executed);
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+}
+
+#[test]
+fn executed_entry_with_other_messages_is_dropped_instead_of_refused() {
+    // A key collision, or a proposal settled outside this core, must not
+    // refuse a different proposal for good.
     let ((mut deps, mut env, host), _) = adopted(&[Status::Open]);
     env.block.height += 1;
-    set_msgs(&host, 2, &fixture_msg("stale"));
+    let filed = msgs_of(&host, 2);
+    set_msgs(&host, 2, &fixture_msg("other"));
     set_status(&host, 2, Status::Executed);
-    assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+    assert!(hook(deps.as_mut(), &env, &filed).is_ok());
     assert!(gated(&deps).is_empty());
 }
 
@@ -171,6 +202,7 @@ fn boundary_height_proposals_do_not_block_later_proposals() {
     let adoption_height = env.block.height;
     let open = push(&host, adoption_height, Status::Open);
     let empty = push(&host, adoption_height, Status::Executed);
+    set_msgs(&host, empty, &[]);
     let dead = push(&host, adoption_height, Status::Rejected);
     env.block.height += 1;
     let later = fixture_msg("later");
@@ -180,16 +212,16 @@ fn boundary_height_proposals_do_not_block_later_proposals() {
     assert!(hook(deps.as_mut(), &env, &later).is_ok());
     assert_eq!(gated(&deps), vec![open]);
     assert_eq!(cursor(&deps), dead);
-    let _ = empty;
 
-    let stale = fixture_msg("stale");
-    set_msgs(&host, open, &stale);
+    let stale = msgs_of(&host, open);
     set_status(&host, open, Status::Executed);
     assert!(hook(deps.as_mut(), &env, &stale)
         .unwrap_err()
         .to_string()
         .contains(&format!("proposal {open} predates")));
     assert!(hook(deps.as_mut(), &env, &later).is_ok());
+    set_status(&host, open, Status::ExecutionFailed);
+    assert!(hook(deps.as_mut(), &env, &stale).is_ok());
     assert!(gated(&deps).is_empty());
 }
 
@@ -234,36 +266,52 @@ fn unresolved_reviewed_proposal_still_fails() {
         .to_string()
         .contains("resolve legacy proposal 2"));
     assert!(BOUNDARY.may_load(&deps.storage).unwrap().is_none());
-    assert!(GATED.may_load(&deps.storage).unwrap().is_none());
+    assert!(gated(&deps).is_empty());
 }
 
 #[test]
-fn gated_proposal_limit_fails_closed() {
+fn any_number_of_unresolved_proposals_can_be_gated() {
     let (mut deps, env, host, payload) = fixture(4);
-    for _ in 0..MAX_GATED {
+    let open = 5 * MAX_GATED_PER_PAYLOAD;
+    for _ in 0..open {
         push(&host, env.block.height - 1, Status::Open);
     }
-    let over = push(&host, env.block.height - 1, Status::Open);
-    assert!(migrate(deps.as_mut(), env.clone(), payload.clone())
-        .unwrap_err()
-        .to_string()
-        .contains("too many unresolved proposals"));
-    set_status(&host, over, Status::Rejected);
     migrate(deps.as_mut(), env.clone(), payload).unwrap();
-    assert_eq!(gated(&deps).len(), MAX_GATED);
+    assert_eq!(gated(&deps).len(), open);
 
-    // One more created at the boundary height blocks execution until any expires.
+    // More created at the boundary height are filed by the next execution.
     let mut env = env;
-    let tail = push(&host, env.block.height, Status::Open);
+    for _ in 0..open {
+        push(&host, env.block.height, Status::Open);
+    }
     env.block.height += 1;
-    assert!(hook(deps.as_mut(), &env, &fixture_msg("later"))
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+    assert_eq!(gated(&deps).len(), 2 * open);
+    assert_eq!(cursor(&deps), 2 * open as u64 + 1);
+
+    // Each one is still refused when it executes.
+    let last = 2 * open as u64 + 1;
+    set_status(&host, last, Status::Executed);
+    assert!(hook(deps.as_mut(), &env, &msgs_of(&host, last)).is_err());
+}
+
+#[test]
+fn only_executions_sharing_messages_with_too_many_blocked_proposals_fail() {
+    let (mut deps, env, host, payload) = fixture(4);
+    let shared = fixture_msg("shared");
+    for _ in 0..=MAX_GATED_PER_PAYLOAD {
+        let id = push(&host, env.block.height - 1, Status::Open);
+        set_msgs(&host, id, &shared);
+    }
+    migrate(deps.as_mut(), env.clone(), payload).unwrap();
+    assert_eq!(gated(&deps).len(), MAX_GATED_PER_PAYLOAD + 1);
+    let mut env = env;
+    env.block.height += 1;
+    assert!(hook(deps.as_mut(), &env, &shared)
         .unwrap_err()
         .to_string()
-        .contains("too many unresolved proposals"));
-    set_status(&host, 2, Status::Rejected);
+        .contains("too many blocked proposals carry these messages"));
     assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
-    assert_eq!(gated(&deps).len(), MAX_GATED);
-    assert_eq!(gated(&deps).last(), Some(&tail));
 }
 
 #[cfg(not(feature = "phoenix-rotation"))]
@@ -343,8 +391,7 @@ fn replacement_with_an_open_proposal_succeeds_and_gates_it() {
     );
 
     // It can no longer execute, and proposals created afterwards can.
-    let stale = fixture_msg("stale");
-    set_msgs(&host, open, &stale);
+    let stale = msgs_of(&host, open);
     set_status(&host, open, Status::Executed);
     env.block.height += 1;
     assert!(hook(deps.as_mut(), &env, &stale).is_err());
@@ -375,12 +422,12 @@ fn membership_update_gates_only_proposals_after_the_reviewed_count() {
         .contains(&format!("resolve legacy proposal {reviewed}")));
     assert_eq!(gated(&deps), vec![2]);
 
-    // The earlier gated proposal expired, so it is dropped rather than carried.
+    // Earlier entries stay filed until an execution with their messages reads them.
     set_status(&host, 2, Status::Rejected);
     set_status(&host, reviewed, Status::Executed);
     let response = sudo(deps.as_mut(), env.clone(), update(reviewed)).unwrap();
     assert_eq!(attribute(&response, "gated_proposals"), Some("4"));
-    assert_eq!(gated(&deps), vec![later]);
+    assert_eq!(gated(&deps), vec![2, later]);
     assert_eq!(cursor(&deps), later);
 }
 
@@ -705,7 +752,7 @@ fn checkpoint_handles_large_history_without_changing_execution_eligibility() {
     assert!(sudo(deps.as_mut(), env.clone(), update(1))
         .unwrap_err()
         .to_string()
-        .contains("proposal count exceeds checked bound"));
+        .contains("proposal count exceeds the scan window"));
     let checkpoint =
         |deps: DepsMut| sudo(deps, env.clone(), SudoMsg::CheckpointProposalHistory {}).unwrap();
     let first = checkpoint(deps.as_mut());
@@ -739,4 +786,197 @@ fn checkpoint_handles_large_history_without_changing_execution_eligibility() {
     assert_eq!(cursor(&deps), count as u64);
     assert_eq!(gated(&deps), vec![second]);
     assert!(PENDING_HISTORY.may_load(&deps.storage).unwrap().is_none());
+}
+
+#[test]
+fn adoption_requires_the_reviewed_group_hooks() {
+    let (mut deps, env, host, mut payload) = fixture(4);
+    host.borrow_mut().hooks = vec!["fixture-hook".to_owned()];
+    assert!(migrate(deps.as_mut(), env.clone(), payload.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("group hooks differ from the reviewed list"));
+    let MigrateMsg::AdoptPhoenix4856 {
+        expected_group_hooks,
+        ..
+    } = &mut payload;
+    *expected_group_hooks = vec!["fixture-hook".to_owned()];
+    migrate(deps.as_mut(), env, payload.clone()).unwrap();
+
+    // A message written before the field existed reviews an empty list.
+    let json = String::from_utf8(to_json_vec(&payload).unwrap()).unwrap();
+    let field = r#""expected_group_hooks":["fixture-hook"],"#;
+    assert!(json.contains(field));
+    let MigrateMsg::AdoptPhoenix4856 {
+        expected_group_hooks,
+        ..
+    } = from_json(json.replace(field, "")).unwrap();
+    assert!(expected_group_hooks.is_empty());
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn ordinary_proposal_cannot_change_group_hooks() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    hook(deps.as_mut(), &env, &fixture_msg("add hook")).unwrap();
+    host.borrow_mut().hooks.push("fixture-hook".to_owned());
+    assert!(finish_guard(deps.as_mut(), &env)
+        .unwrap_err()
+        .to_string()
+        .contains("changing group hooks requires governance"));
+    host.borrow_mut().hooks.clear();
+    assert_eq!(finish_guard(deps.as_mut(), &env).unwrap(), Response::new());
+}
+
+// The reply wasmd delivers after the core instantiates a proposal module
+// that returns callback messages.
+#[cfg(feature = "phoenix-rotation")]
+fn module_callback(deps: DepsMut, env: &Env, msgs: Vec<CosmosMsg>) -> Result<Response, String> {
+    use cosmwasm_std::{Reply, SubMsgResponse, SubMsgResult};
+    fn field(tag: u8, bytes: &[u8], out: &mut Vec<u8>) {
+        out.push(tag);
+        let mut len = bytes.len();
+        while len >= 0x80 {
+            out.push(len as u8 | 0x80);
+            len >>= 7;
+        }
+        out.push(len as u8);
+        out.extend_from_slice(bytes);
+    }
+    let callback =
+        to_json_binary(&dao_interface::state::ModuleInstantiateCallback { msgs }).unwrap();
+    let mut data = Vec::new();
+    field(0x0a, b"fixture-new-module", &mut data);
+    field(0x12, callback.as_slice(), &mut data);
+    let reply = Reply {
+        id: 0,
+        result: SubMsgResult::Ok(SubMsgResponse {
+            events: vec![],
+            data: Some(data.into()),
+        }),
+    };
+    contract::reply(deps, env.clone(), reply).map_err(|err| err.to_string())
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn new_module_callbacks_get_the_same_check_as_proposal_messages() {
+    let (mut deps, mut env, _) = settled(&[]);
+    env.block.height += 1;
+    crate::state::TOTAL_PROPOSAL_MODULE_COUNT
+        .save(&mut deps.storage, &1)
+        .unwrap();
+    let takeover: CosmosMsg = WasmMsg::UpdateAdmin {
+        contract_addr: GROUP.to_owned(),
+        admin: "fixture-attacker".to_owned(),
+    }
+    .into();
+
+    // Outside a proposal the core is acting for governance or at instantiation.
+    assert!(module_callback(deps.as_mut(), &env, vec![takeover.clone()]).is_ok());
+
+    hook(deps.as_mut(), &env, &fixture_msg("add module")).unwrap();
+    assert!(module_callback(deps.as_mut(), &env, vec![takeover])
+        .unwrap_err()
+        .contains("companion contract administration requires governance"));
+    let harmless = fixture_msg("callback");
+    let response = module_callback(deps.as_mut(), &env, harmless.clone()).unwrap();
+    assert_eq!(response.messages[0].msg, harmless[0]);
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn governance_send_that_changes_the_roster_sets_a_boundary() {
+    use cosmwasm_std::{Reply, ReplyOn, SubMsgResponse, SubMsgResult};
+    let (mut deps, mut env, host) = settled(&[]);
+    sudo(
+        deps.as_mut(),
+        env.clone(),
+        SudoMsg::SetSendAsDao { enabled: true },
+    )
+    .unwrap();
+    env.block.time = env.block.time.plus_seconds(48 * 60 * 60);
+    env.block.height += 1;
+    let open = push(&host, env.block.height, Status::Open);
+    env.block.height += 1;
+    let adoption = BOUNDARY.load(&deps.storage).unwrap();
+    let send = SudoMsg::SendAsDao {
+        messages: [fixture_msg("first"), fixture_msg("last")].concat(),
+    };
+    let finish = |deps: DepsMut| {
+        let reply = Reply {
+            id: SEND_REPLY_ID,
+            result: SubMsgResult::Ok(SubMsgResponse {
+                events: vec![],
+                data: None,
+            }),
+        };
+        contract::reply(deps, env.clone(), reply).unwrap()
+    };
+
+    // Messages that leave the roster alone leave proposals executable.
+    let response = sudo(deps.as_mut(), env.clone(), send.clone()).unwrap();
+    let [first, last] = response.messages.as_slice() else {
+        panic!("expected both messages")
+    };
+    assert_eq!((first.id, &first.reply_on), (0, &ReplyOn::Never));
+    assert_eq!(
+        (last.id, &last.reply_on),
+        (SEND_REPLY_ID, &ReplyOn::Success)
+    );
+    assert_eq!(finish(deps.as_mut()), Response::new());
+    assert_eq!(BOUNDARY.load(&deps.storage).unwrap(), adoption);
+    assert!(gated(&deps).is_empty());
+
+    // A roster change blocks the proposals that snapshotted the old roster.
+    sudo(deps.as_mut(), env.clone(), send).unwrap();
+    host.borrow_mut().members[0].addr = "fixture-next".to_owned();
+    let response = finish(deps.as_mut());
+    assert_eq!(
+        attribute(&response, "membership_boundary"),
+        Some(env.block.height.to_string().as_str())
+    );
+    assert_eq!(attribute(&response, "gated_proposals"), Some("2"));
+    assert_eq!(gated(&deps), vec![open]);
+    let boundary = BOUNDARY.load(&deps.storage).unwrap();
+    assert_eq!(
+        (boundary.height, boundary.proposal_count),
+        (env.block.height, open)
+    );
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn two_membership_actions_succeed_in_one_block() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    let replace = |outgoing: &str, incoming: &str| SudoMsg::ReplaceBoardMember {
+        outgoing: outgoing.to_owned(),
+        incoming: incoming.to_owned(),
+        expected_weight: SEAT_WEIGHT,
+    };
+    sudo(
+        deps.as_mut(),
+        env.clone(),
+        replace("fixture-member-1", "fixture-next-1"),
+    )
+    .unwrap();
+    {
+        // The first update has applied. The block-start snapshot no longer
+        // matches the roster the second action reads.
+        let mut h = host.borrow_mut();
+        h.members[0].addr = "fixture-next-1".to_owned();
+        h.block_start_weight = Some(0);
+    }
+    sudo(
+        deps.as_mut(),
+        env.clone(),
+        replace("fixture-member-2", "fixture-next-2"),
+    )
+    .unwrap();
+    assert_eq!(
+        BOUNDARY.load(&deps.storage).unwrap().height,
+        env.block.height
+    );
 }

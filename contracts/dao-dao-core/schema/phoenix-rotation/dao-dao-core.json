@@ -2941,6 +2941,14 @@
               "expected_creation_policy": {
                 "$ref": "#/definitions/ProposalCreationPolicy"
               },
+              "expected_group_hooks": {
+                "description": "Complete, reviewed list of hooks registered on the membership group. A hook runs on every membership change and can make it fail.",
+                "default": [],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
               "expected_members": {
                 "description": "Complete, reviewed current roster. Every address must be a distinct 25-weight seat.",
                 "type": "array",
@@ -3172,10 +3180,20 @@
         ]
       },
       "MigrationAdmin": {
-        "type": "string",
-        "enum": [
-          "keep_current_admin",
-          "governance_only"
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "governance_only"
+            ]
+          },
+          {
+            "description": "The core stays its own host admin, so the DAO keeps upgrade authority. An ordinary proposal can then migrate the core or reassign its admin, which removes every governance control in this build. Those controls are binding only once the admin is governance: choose `GovernanceOnly`, or have governance call `SetMigrationAdmin` afterwards.",
+            "type": "string",
+            "enum": [
+              "keep_current_admin"
+            ]
+          }
         ]
       },
       "PercentageThreshold": {
@@ -3490,7 +3508,7 @@
         "additionalProperties": false
       },
       {
-        "description": "Classify up to 48 proposals toward the next membership change. Repeat until the reported cursor has caught up with the proposal count.",
+        "description": "Classify up to 48 proposals toward the next membership change. Repeat until the reported cursor has caught up with the proposal count.\n\nA membership change scans at most 512 proposals created since the last boundary or checkpoint. Past that, every membership change fails, including a roster change made by an ordinary proposal, until governance has checkpointed the backlog.",
         "type": "object",
         "required": [
           "checkpoint_proposal_history"
@@ -3573,6 +3591,7 @@
         "additionalProperties": false
       },
       {
+        "description": "Dispatch messages as the DAO. If they change the group roster, a new membership boundary blocks the proposals that were still unresolved.",
         "type": "object",
         "required": [
           "send_as_dao"

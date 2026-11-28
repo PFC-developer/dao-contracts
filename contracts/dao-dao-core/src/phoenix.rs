@@ -2,13 +2,16 @@ use cosmwasm_schema::cw_serde;
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_json_binary, Addr, CosmosMsg, Deps, DepsMut, Empty, Env, HexBinary, Order, Response,
-    StdError, StdResult, Storage, SubMsg, Uint128, WasmMsg,
+    to_json_binary, to_json_vec, Addr, CosmosMsg, Deps, DepsMut, Empty, Env, HexBinary, Order,
+    Response, StdError, StdResult, Storage, SubMsg, Uint128, WasmMsg,
 };
 use cw2::get_contract_version;
-use cw4::{AdminResponse, Cw4QueryMsg, MemberListResponse, MemberResponse, TotalWeightResponse};
+use cw4::{
+    AdminResponse, Cw4QueryMsg, HooksResponse, MemberListResponse, MemberResponse,
+    TotalWeightResponse,
+};
 use cw4_group::msg::ExecuteMsg as GroupExecute;
-use cw_storage_plus::Item;
+use cw_storage_plus::{Item, Map};
 use cw_utils::Duration;
 use dao_interface::{msg::MigrateMsg as UpstreamMigrate, state::ProposalModuleStatus, voting};
 use dao_voting::{
@@ -48,14 +51,24 @@ const PROPOSALS_PER_QUERY: u64 = 12;
 #[cfg(feature = "phoenix-rotation")]
 const PROPOSALS_PER_CHECKPOINT: u64 = 4 * PROPOSALS_PER_QUERY;
 
-const MAX_GATED: usize = 64;
+// Bounds the work one execution does for blocked proposals that carry the same
+// messages as the executing one. It never limits a boundary.
+const MAX_GATED_PER_PAYLOAD: usize = 64;
 #[cfg(feature = "phoenix-rotation")]
 const GUARD_REPLY_ID: u64 = 4856;
+#[cfg(feature = "phoenix-rotation")]
+const SEND_REPLY_ID: u64 = 4857;
 
 const BOUNDARY: Item<SnapshotBoundary> = Item::new("phoenix_snapshot_boundary_v1");
 /// Proposals that were unresolved when a boundary was set. They snapshot an
 /// earlier roster, so the core refuses to dispatch their messages.
-const GATED: Item<Vec<u64>> = Item::new("phoenix_gated_proposals_v1");
+///
+/// The execution hook carries messages but no proposal ID, so blocked IDs are
+/// filed under a key derived from their messages. An execution reads only the
+/// entry for its own messages, however many proposals are blocked in total.
+/// Keys come from this build's encoding of the messages, so a successor build
+/// must keep that encoding or refile the entries.
+const GATED: Map<u64, Vec<u64>> = Map::new("phoenix_gated_messages_v1");
 #[cfg(feature = "phoenix-rotation")]
 const PENDING_HISTORY: Item<PendingHistory> = Item::new("phoenix_pending_history_v1");
 #[cfg(feature = "phoenix-rotation")]
@@ -80,6 +93,10 @@ pub enum MigrateMsg {
         /// resolved. Later proposals do not stop adoption, but any of them still
         /// unresolved at adoption is permanently blocked from executing.
         expected_proposal_count: u64,
+        /// Complete, reviewed list of hooks registered on the membership group.
+        /// A hook runs on every membership change and can make it fail.
+        #[serde(default)]
+        expected_group_hooks: Vec<String>,
         /// Optional settings for the transition. Omitted values retain the original adoption path.
         governance: Option<GovernanceOptions>,
     },
@@ -186,13 +203,15 @@ struct GuardedBatch {
     proposal_count: u64,
     veto: Option<VetoConfig>,
     members: Vec<cw4::Member>,
+    hooks: Vec<String>,
     seated_voting_period: Option<Duration>,
 }
 
 struct PlannedBoundary {
     proposal_count: u64,
-    gated: Vec<u64>,
-    added: usize,
+    /// Newly blocked proposals with the key their messages are filed under.
+    /// A proposal whose messages can never reach the core has no key.
+    gated: Vec<(u64, Option<u64>)>,
 }
 
 fn require(condition: bool, message: impl Into<String>) -> StdResult<()> {
@@ -229,6 +248,15 @@ fn check_binding(deps: Deps, env: &Env) -> StdResult<()> {
         admin.admin.as_deref() == Some(CORE),
         "core must administer group membership",
     )
+}
+
+fn group_hooks(deps: Deps) -> StdResult<Vec<String>> {
+    let response: HooksResponse = deps
+        .querier
+        .query_wasm_smart(GROUP, &Cw4QueryMsg::Hooks {})?;
+    let mut hooks = response.hooks;
+    hooks.sort_unstable();
+    Ok(hooks)
 }
 
 fn check_proposal_module(deps: Deps) -> StdResult<()> {
@@ -362,6 +390,7 @@ fn visit_proposals(
     Ok(())
 }
 
+#[cfg(feature = "phoenix-rotation")]
 fn keep_unresolved(deps: Deps, ids: impl IntoIterator<Item = u64>) -> StdResult<Vec<u64>> {
     let mut unresolved = Vec::new();
     for id in ids {
@@ -402,10 +431,6 @@ fn checkpoint_history(deps: DepsMut, boundary: &SnapshotBoundary) -> StdResult<R
         }
         Ok(())
     })?;
-    require(
-        history.unresolved.len() <= MAX_GATED,
-        "too many unresolved proposals to checkpoint",
-    )?;
     history.through = end;
     PENDING_HISTORY.save(deps.storage, &history)?;
     Ok(Response::new()
@@ -414,8 +439,49 @@ fn checkpoint_history(deps: DepsMut, boundary: &SnapshotBoundary) -> StdResult<R
         .add_attribute("proposal_count", count.to_string()))
 }
 
+// FNV-1a over the core's own encoding of the messages. A collision only adds
+// a candidate; a candidate is refused after its stored messages are compared.
+fn payload_key<'a>(msgs: impl IntoIterator<Item = &'a CosmosMsg<Empty>>) -> StdResult<u64> {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for msg in msgs {
+        for byte in to_json_vec(msg)? {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
+        }
+        // Separate messages so that their boundaries affect the key.
+        hash = (hash ^ 0xff).wrapping_mul(PRIME);
+    }
+    Ok(hash)
+}
+
+// The key a blocked proposal is filed under, or none when its messages can
+// never reach the execution hook: the module does not call the core for a
+// proposal without messages, and the hook decodes messages through this same
+// type, so messages that do not decode here cannot be dispatched either.
+fn gate_key(deps: Deps, id: u64) -> StdResult<Option<u64>> {
+    let record = deps
+        .querier
+        .query_wasm_smart::<ExecutedRecord>(PROPOSAL, &ProposalQuery::Proposal { proposal_id: id });
+    match record {
+        Ok(record) if !record.proposal.msgs.is_empty() => {
+            payload_key(&record.proposal.msgs).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn file_gated(storage: &mut dyn Storage, key: u64, id: u64) -> StdResult<()> {
+    let mut ids = GATED.may_load(storage, key)?.unwrap_or_default();
+    if !ids.contains(&id) {
+        ids.push(id);
+        GATED.save(storage, key, &ids)?;
+    }
+    Ok(())
+}
+
 // Classify proposals since the last boundary. Those up to the reviewed ID
-// must be resolved. Any later unresolved proposals are gated instead.
+// must be resolved. Any later unresolved proposals are gated instead, however
+// many there are, so opening proposals cannot stop a boundary from being set.
 fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBoundary> {
     let count = proposal_count(deps)?;
     require(
@@ -433,18 +499,15 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
         count
             .checked_sub(checked)
             .is_some_and(|n| n <= MAX_PROPOSALS_TO_CHECK),
-        "proposal count exceeds checked bound",
+        "proposal count exceeds the scan window; checkpoint proposal history first",
     )?;
-    // This runs outside proposal execution or after the executing proposal has
-    // passed the existing gate, so an executed gated entry is settled.
-    let mut gated = keep_unresolved(deps, GATED.may_load(deps.storage)?.unwrap_or_default())?;
-    let carried = gated.len();
+    let mut gated = Vec::new();
     let mut gate = |id| -> StdResult<()> {
         require(
             id > reviewed,
             format!("resolve legacy proposal {id} before changing membership"),
         )?;
-        gated.push(id);
+        gated.push((id, gate_key(deps, id)?));
         Ok(())
     };
     for id in staged {
@@ -456,23 +519,22 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
         }
         Ok(())
     })?;
-    require(
-        gated.len() <= MAX_GATED,
-        "too many unresolved proposals to block",
-    )?;
     Ok(PlannedBoundary {
         proposal_count: count,
-        added: gated.len() - carried,
         gated,
     })
 }
 
 impl PlannedBoundary {
     /// Record the boundary and return the proposals it newly blocks.
-    fn save(mut self, storage: &mut dyn Storage, height: u64) -> StdResult<Vec<u64>> {
+    fn save(self, storage: &mut dyn Storage, height: u64) -> StdResult<Vec<u64>> {
         #[cfg(feature = "phoenix-rotation")]
         PENDING_HISTORY.remove(storage);
-        GATED.save(storage, &self.gated)?;
+        for &(id, key) in &self.gated {
+            if let Some(key) = key {
+                file_gated(storage, key, id)?;
+            }
+        }
         BOUNDARY.save(
             storage,
             &SnapshotBoundary {
@@ -480,7 +542,7 @@ impl PlannedBoundary {
                 proposal_count: self.proposal_count,
             },
         )?;
-        Ok(self.gated.split_off(self.gated.len() - self.added))
+        Ok(self.gated.into_iter().map(|(id, _)| id).collect())
     }
 }
 
@@ -540,14 +602,6 @@ pub(crate) fn gate_execution(
         env.block.height > boundary.height,
         "proposal execution blocked at the membership boundary height",
     )?;
-    let stored = GATED.may_load(deps.storage)?.unwrap_or_default();
-    let mut gated = Vec::with_capacity(stored.len());
-    for &id in &stored {
-        let proposal = load_proposal(deps.as_ref(), id)?;
-        if stays_gated(deps.as_ref(), id, &proposal.status, &response.messages)? {
-            gated.push(id);
-        }
-    }
     // Proposals created at the boundary height after the boundary was set are
     // only visible later. The common case is one query that finds none.
     let mut cursor = boundary.proposal_count;
@@ -577,20 +631,15 @@ pub(crate) fn gate_execution(
                 &record.proposal.status,
                 &response.messages,
             )? {
-                gated.push(record.id);
+                if let Some(key) = gate_key(deps.as_ref(), record.id)? {
+                    file_gated(deps.storage, key, record.id)?;
+                }
             }
         }
         if !full {
             break;
         }
         limit = PROPOSALS_PER_QUERY;
-    }
-    require(
-        gated.len() <= MAX_GATED,
-        "too many unresolved proposals to block",
-    )?;
-    if gated != stored {
-        GATED.save(deps.storage, &gated)?;
     }
     if cursor != boundary.proposal_count {
         BOUNDARY.save(
@@ -600,6 +649,26 @@ pub(crate) fn gate_execution(
                 proposal_count: cursor,
             },
         )?;
+    }
+    // Only blocked proposals that carry these messages can be the one running.
+    let key = payload_key(response.messages.iter().map(|m| &m.msg))?;
+    if let Some(stored) = GATED.may_load(deps.storage, key)? {
+        require(
+            stored.len() <= MAX_GATED_PER_PAYLOAD,
+            "too many blocked proposals carry these messages",
+        )?;
+        let mut gated = Vec::with_capacity(stored.len());
+        for &id in &stored {
+            let proposal = load_proposal(deps.as_ref(), id)?;
+            if stays_gated(deps.as_ref(), id, &proposal.status, &response.messages)? {
+                gated.push(id);
+            }
+        }
+        if gated.is_empty() {
+            GATED.remove(deps.storage, key);
+        } else if gated != stored {
+            GATED.save(deps.storage, key, &gated)?;
+        }
     }
     guard_pinned_config(deps, response)
 }
@@ -640,12 +709,14 @@ fn guard_pinned_config(deps: DepsMut, mut response: Response) -> StdResult<Respo
     let proposal_count = proposal_count(deps.as_ref())?;
     let seated_voting_period =
         governance::has_seat(deps.storage, &members)?.then_some(cfg.max_voting_period);
+    let hooks = group_hooks(deps.as_ref())?;
     GUARDED_BATCH.save(
         deps.storage,
         &GuardedBatch {
             proposal_count,
             veto: cfg.veto,
             members,
+            hooks,
             seated_voting_period,
         },
     )?;
@@ -666,6 +737,9 @@ fn guard_pinned_config(_deps: DepsMut, response: Response) -> StdResult<Response
 /// Handle the reply requested by the execution hook, if `id` is that reply.
 #[cfg(feature = "phoenix-rotation")]
 pub(crate) fn guard_reply(deps: DepsMut, env: &Env, id: u64) -> StdResult<Option<Response>> {
+    if id == SEND_REPLY_ID {
+        return governance::send_reply(deps, env).map(Some);
+    }
     if id != GUARD_REPLY_ID {
         return Ok(None);
     }
@@ -674,6 +748,11 @@ pub(crate) fn guard_reply(deps: DepsMut, env: &Env, id: u64) -> StdResult<Option
     require(
         cfg.veto == batch.veto,
         "proposal veto configuration changed",
+    )?;
+    // A hook runs inside every membership update and can make it fail.
+    require(
+        group_hooks(deps.as_ref())? == batch.hooks,
+        "changing group hooks requires governance",
     )?;
     let members = governance::check_current_roster(deps.as_ref())?;
     require(
@@ -771,8 +850,18 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
         expected_proposal_config,
         expected_creation_policy,
         expected_proposal_count,
+        expected_group_hooks,
         governance,
     } = msg;
+    let mut expected_group_hooks = expected_group_hooks
+        .iter()
+        .map(|hook| deps.api.addr_validate(hook).map(Addr::into_string))
+        .collect::<StdResult<Vec<_>>>()?;
+    expected_group_hooks.sort_unstable();
+    require(
+        group_hooks(deps.as_ref())? == expected_group_hooks,
+        "group hooks differ from the reviewed list",
+    )?;
     let outgoing = deps.api.addr_validate(&outgoing)?.into_string();
     check_roster(
         deps.as_ref(),

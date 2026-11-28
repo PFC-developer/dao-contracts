@@ -145,8 +145,8 @@ messages to those contracts through their existing execute interfaces. The
 same check applies to the callback messages of a proposal module that an
 ordinary proposal adds. The dispatch check reserves membership group hooks
 and its internal admin for governance, and likewise the proposal module's
-proposal hooks, vote hooks and pre-propose module. A hook runs on every
-status change or vote, so one could make a veto or the voting proxy's
+DAO role, proposal hooks, vote hooks and pre-propose module. A hook runs on
+every status change or vote, so one could make a veto or the voting proxy's
 deciding vote fail.
 
 When migration installs a governance veto, it requires a nonzero timelock

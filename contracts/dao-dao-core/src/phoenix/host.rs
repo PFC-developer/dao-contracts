@@ -7,7 +7,9 @@ use osmosis_std::types::{
     },
 };
 
-use super::{require, GroupExecute, CORE, GROUP, PROPOSAL, VOTING};
+#[cfg(test)]
+use super::ProposalConfig;
+use super::{require, GroupExecute, ProposalExecute, CORE, GROUP, PROPOSAL, VOTING};
 
 fn companion(address: &str) -> bool {
     [GROUP, PROPOSAL, VOTING]
@@ -57,6 +59,15 @@ fn check_contract_execute(address: &str, msg: &[u8]) -> StdResult<()> {
             from_json::<ProposalModuleAdmin>(msg).is_err(),
             "changing proposal module hooks or pre-propose requires governance",
         )?;
+        // A proposal can otherwise hand the module's DAO role to an
+        // intermediary, have it perform one of the reserved admin calls, and
+        // restore the DAO before the batch reply checks the final config.
+        if let Ok(ProposalExecute::UpdateConfig(config)) = from_json::<ProposalExecute>(msg) {
+            require(
+                config.dao.eq_ignore_ascii_case(CORE),
+                "changing proposal module DAO requires governance",
+            )?;
+        }
     }
     Ok(())
 }
@@ -196,6 +207,44 @@ mod tests {
                 funds: vec![],
             };
             assert!(check_messages(&Response::new().add_message(elsewhere)).is_ok());
+        }
+    }
+
+    #[test]
+    fn ordinary_messages_cannot_delegate_proposal_module_administration() {
+        for (dao, allowed) in [(CORE, true), ("fixture-intermediary", false)] {
+            let msg =
+                cosmwasm_std::to_json_binary(&ProposalExecute::UpdateConfig(ProposalConfig {
+                    threshold: dao_voting::threshold::Threshold::AbsoluteCount {
+                        threshold: cosmwasm_std::Uint128::new(75),
+                    },
+                    max_voting_period: cw_utils::Duration::Time(604_800),
+                    min_voting_period: None,
+                    only_members_execute: false,
+                    allow_revoting: false,
+                    dao: dao.to_owned(),
+                    close_proposal_on_execution_failure: false,
+                    veto: None,
+                }))
+                .unwrap();
+            let typed = WasmMsg::Execute {
+                contract_addr: PROPOSAL.to_owned(),
+                msg: msg.clone(),
+                funds: vec![],
+            };
+            let native = MsgExecuteContract {
+                contract: PROPOSAL.to_owned(),
+                msg: msg.to_vec(),
+                ..Default::default()
+            };
+            assert_eq!(
+                check_messages(&Response::new().add_message(typed)).is_ok(),
+                allowed
+            );
+            assert_eq!(
+                check_messages(&Response::new().add_message(native)).is_ok(),
+                allowed
+            );
         }
     }
 

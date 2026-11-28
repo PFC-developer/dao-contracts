@@ -100,8 +100,15 @@ new build that is reviewed separately.
 Adoption removes the outgoing member and sets a proposal snapshot boundary.
 A proposal that is unresolved at a boundary, or created in the same block
 after it, can no longer dispatch its messages. Any number of proposals can
-be blocked this way. Adoption takes the reviewed list of group hooks and
-fails if the live list differs.
+be blocked this way. Adoption takes the reviewed lists of group hooks and
+of the proposal module's proposal hooks and vote hooks, and fails if a
+live list differs.
+
+Opening proposals cannot stop adoption. Every proposal up to the reviewed
+count must be resolved, and that reviewed range must fit in 512 proposals.
+Adoption classifies at most 512 proposals in all and reports any it leaves
+as `unscanned_proposals`. Those are classified afterwards, before anything
+can execute.
 
 The pinned proposal module's execution hook carries a proposal's messages
 and no ID, so blocked proposals are filed under their messages. A later
@@ -117,9 +124,10 @@ its blocked proposals settle.
 Adoption sets the only boundary. A later roster change made by an ordinary
 proposal sets none, so proposals created under the previous roster can
 still execute. There is no `sudo` entry point and no checkpoint action.
-If a long run of proposals is created in the adoption block after the
-adoption transaction, the first execution afterwards files all of them and
-needs a correspondingly high gas limit.
+If adoption leaves proposals unclassified, or a long run of proposals is
+created in the adoption block after the adoption transaction, the first
+execution afterwards files all of them and needs a correspondingly high
+gas limit.
 
 ### Governance build
 
@@ -136,12 +144,26 @@ proposal contracts for governance. Ordinary proposals can still dispatch
 messages to those contracts through their existing execute interfaces. The
 same check applies to the callback messages of a proposal module that an
 ordinary proposal adds. The dispatch check reserves membership group hooks
-and its internal admin for governance.
+and its internal admin for governance, and likewise the proposal module's
+proposal hooks, vote hooks and pre-propose module. A hook runs on every
+status change or vote, so one could make a veto or the voting proxy's
+deciding vote fail.
 
 When migration installs a governance veto, it requires a nonzero timelock
 and veto-before-passed support. The configured vetoer can therefore use the
 proposal module's ordinary veto while a proposal is open or during its
-post-passage timelock.
+post-passage timelock. While a veto is configured, ordinary proposals
+cannot change the maximum or minimum voting period, so they cannot shorten
+the time a proposal stays open to a veto. The timelock itself is whatever
+the reviewed adoption message sets; no minimum is enforced, so review it
+against the time governance needs to act.
+
+The voting proxy's response window is counted in blocks. With a
+height-based voting period the window must end before the period does.
+With a time-based voting period nothing checks this, so choose a window
+safely shorter than the voting period at the chain's slowest expected
+block time. Otherwise a proposal can expire before the proxy may decide a
+partial ballot.
 
 These controls bind only once governance is the core's host admin. With
 `KeepCurrentAdmin` the core stays its own admin and the DAO keeps upgrade
@@ -159,7 +181,11 @@ from that account.
 A membership change scans at most 512 proposals created since the previous
 one. Past that, every membership change fails, including one made by an
 ordinary proposal, until governance has run `CheckpointProposalHistory`
-over the backlog. Each call classifies up to 48 proposals, advances a long
+over the backlog. Proposals opened while a governance vote is running can
+outpace the checkpoints bundled with a membership action. The action then
+fails and has to be retried with more checkpoints. The same checkpoints
+classify what adoption left unscanned; until they have, executions fail.
+Each call classifies up to 48 proposals, advances a long
 same-block tail, and prunes up to 48 settled entries. Its event reports
 `checked_through` against `proposal_count`, the `boundary_cursor`, the
 number `pruned`, and `prune_complete`, which is `false` while the pruning

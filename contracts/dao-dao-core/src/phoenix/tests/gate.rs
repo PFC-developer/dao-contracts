@@ -761,8 +761,20 @@ fn guard_checks_new_snapshots_against_protected_threshold_and_veto() {
     let nested = hook(deps.as_mut(), &env, &fixture_msg("nested")).unwrap();
     assert_eq!(nested.messages[0].reply_on, cosmwasm_std::ReplyOn::Never);
 
+    // A proposal created in the batch saves the configured voting period.
+    let period = host.borrow().config.max_voting_period;
+    let push_current = || {
+        let id = push(&host, env.block.height, Status::Open);
+        host.borrow_mut()
+            .proposals
+            .last_mut()
+            .unwrap()
+            .proposal
+            .expiration = period.after(&env.block);
+        id
+    };
     for _ in 0..PROPOSALS_PER_QUERY {
-        push(&host, env.block.height, Status::Open);
+        push_current();
         host.borrow_mut()
             .proposals
             .last_mut()
@@ -770,7 +782,7 @@ fn guard_checks_new_snapshots_against_protected_threshold_and_veto() {
             .proposal
             .veto = veto.clone();
     }
-    let id = push(&host, env.block.height, Status::Open);
+    let id = push_current();
     let expected = format!("proposal {id} saved different threshold or veto rules");
     assert!(finish_guard(deps.as_mut(), &env)
         .unwrap_err()
@@ -1377,4 +1389,183 @@ fn checkpoint_reports_its_pruning_and_tail_progress() {
         assert_eq!(attribute(&response, "prune_complete"), Some(complete));
     }
     assert!(gated(&deps).is_empty());
+}
+
+#[test]
+fn adoption_requires_the_reviewed_proposal_module_hooks() {
+    for vote in [false, true] {
+        let (mut deps, env, host, mut payload) = fixture(4);
+        let hook = vec!["fixture-hook".to_owned()];
+        if vote {
+            host.borrow_mut().vote_hooks = hook.clone();
+        } else {
+            host.borrow_mut().proposal_hooks = hook.clone();
+        }
+        let name = if vote { "vote" } else { "proposal" };
+        assert!(migrate(deps.as_mut(), env.clone(), payload.clone())
+            .unwrap_err()
+            .to_string()
+            .contains(&format!("{name} hooks differ from the reviewed list")));
+        let MigrateMsg::AdoptPhoenix4856 {
+            expected_proposal_hooks,
+            expected_vote_hooks,
+            ..
+        } = &mut payload;
+        *(if vote {
+            expected_vote_hooks
+        } else {
+            expected_proposal_hooks
+        }) = hook;
+        migrate(deps.as_mut(), env, payload).unwrap();
+    }
+}
+
+#[test]
+fn opening_proposals_cannot_stop_adoption() {
+    let (mut deps, env, host, payload) = fixture(4);
+    let extra = 100;
+    for _ in 0..MAX_PROPOSALS_TO_CHECK + extra {
+        push(&host, env.block.height - 1, Status::Open);
+    }
+    let count = host.borrow().proposals.len() as u64;
+    let response = migrate(deps.as_mut(), env.clone(), payload.clone()).unwrap();
+    // One scan window is classified. The rest is left for later.
+    assert_eq!(cursor(&deps), MAX_PROPOSALS_TO_CHECK);
+    assert_eq!(
+        attribute(&response, "unscanned_proposals"),
+        Some((count - MAX_PROPOSALS_TO_CHECK).to_string().as_str())
+    );
+    assert_eq!(gated(&deps).len() as u64, MAX_PROPOSALS_TO_CHECK - 1);
+
+    // A proposal left unclassified still cannot execute.
+    let mut env = env;
+    env.block.height += 1;
+    set_status(&host, count, Status::Executed);
+    assert!(hook(deps.as_mut(), &env, &msgs_of(&host, count)).is_err());
+
+    // The reviewed range itself has to fit the window.
+    let (mut deps, env, host, mut payload) = fixture(4);
+    for _ in 0..MAX_PROPOSALS_TO_CHECK {
+        push(&host, env.block.height - 1, Status::Executed);
+    }
+    let MigrateMsg::AdoptPhoenix4856 {
+        expected_proposal_count,
+        ..
+    } = &mut payload;
+    *expected_proposal_count = MAX_PROPOSALS_TO_CHECK + 1;
+    assert!(migrate(deps.as_mut(), env, payload)
+        .unwrap_err()
+        .to_string()
+        .contains("reviewed proposal count exceeds the scan window"));
+}
+
+#[cfg(not(feature = "phoenix-rotation"))]
+#[test]
+fn default_build_classifies_the_rest_at_the_first_execution() {
+    let (mut deps, env, host, payload) = fixture(4);
+    for _ in 0..MAX_PROPOSALS_TO_CHECK + 100 {
+        push(&host, env.block.height - 1, Status::Open);
+    }
+    let count = host.borrow().proposals.len() as u64;
+    migrate(deps.as_mut(), env.clone(), payload).unwrap();
+    let mut env = env;
+    env.block.height += 1;
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+    assert_eq!(cursor(&deps), count);
+    assert_eq!(gated(&deps).len() as u64, count - 1);
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn governance_build_classifies_the_rest_by_checkpoint() {
+    let (mut deps, env, host, payload) = fixture(4);
+    for _ in 0..2 * MAX_PROPOSALS_TO_CHECK + 1 {
+        push(&host, env.block.height - 1, Status::Open);
+    }
+    let count = host.borrow().proposals.len() as u64;
+    migrate(deps.as_mut(), env.clone(), payload).unwrap();
+    {
+        let mut h = host.borrow_mut();
+        h.core_admin = GOV.to_owned();
+        h.members.remove(0);
+        h.config.threshold = Threshold::AbsoluteCount {
+            threshold: YES_WEIGHT,
+        };
+    }
+    let mut env = env;
+    env.block.height += 1;
+    // More is left than one execution classifies, so executions wait.
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("later"))
+        .unwrap_err()
+        .to_string()
+        .contains("checkpoint proposal history first"));
+    let mut calls = 0;
+    while cursor(&deps) < count {
+        checkpoint(deps.as_mut(), &env);
+        calls += 1;
+        assert!(calls <= count / PROPOSALS_PER_CHECKPOINT + 1);
+    }
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+    assert_eq!(gated(&deps).len() as u64, count - 1);
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn ordinary_proposals_cannot_shorten_voting_periods_under_a_veto() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    let veto = Some(VetoConfig {
+        timelock_duration: Duration::Time(60),
+        vetoer: GOV.to_owned(),
+        early_execute: false,
+        veto_before_passed: true,
+    });
+    let max = host.borrow().config.max_voting_period;
+    let min = Some(Duration::Time(3600));
+    host.borrow_mut().config.veto = veto.clone();
+    host.borrow_mut().config.min_voting_period = min;
+    hook(deps.as_mut(), &env, &fixture_msg("ordinary")).unwrap();
+    let changed = |deps: DepsMut| {
+        finish_guard(deps, &env)
+            .unwrap_err()
+            .to_string()
+            .contains("proposal voting periods changed under a veto")
+    };
+
+    host.borrow_mut().config.max_voting_period = Duration::Time(1);
+    assert!(changed(deps.as_mut()));
+    host.borrow_mut().config.max_voting_period = max;
+    host.borrow_mut().config.min_voting_period = None;
+    assert!(changed(deps.as_mut()));
+    host.borrow_mut().config.min_voting_period = min;
+
+    // A proposal created with other periods while the batch ran is refused too.
+    let id = push(&host, env.block.height, Status::Open);
+    let saved = |expiration, min_voting_period| {
+        let mut h = host.borrow_mut();
+        let proposal = &mut h.proposals.last_mut().unwrap().proposal;
+        proposal.veto = veto.clone();
+        proposal.expiration = expiration;
+        proposal.min_voting_period = min_voting_period;
+    };
+    let expected = format!("proposal {id} saved different voting periods");
+    let short = Duration::Time(1).after(&env.block);
+    let full = max.after(&env.block);
+    let floor = min.map(|min| min.after(&env.block));
+    for (expiration, min_voting_period) in [(short, floor), (full, None)] {
+        saved(expiration, min_voting_period);
+        assert!(finish_guard(deps.as_mut(), &env)
+            .unwrap_err()
+            .to_string()
+            .contains(&expected));
+    }
+    saved(full, floor);
+    assert_eq!(finish_guard(deps.as_mut(), &env).unwrap(), Response::new());
+
+    // Without a veto the DAO keeps control of its voting periods.
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    hook(deps.as_mut(), &env, &fixture_msg("ordinary")).unwrap();
+    host.borrow_mut().config.max_voting_period = Duration::Time(1);
+    assert_eq!(finish_guard(deps.as_mut(), &env).unwrap(), Response::new());
 }

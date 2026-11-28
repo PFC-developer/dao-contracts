@@ -29,6 +29,19 @@ fn grant_wasm_authority(address: &str) -> StdResult<()> {
     )
 }
 
+// The proposal module messages that install or remove code run on every
+// status change, vote, or proposal. One of them can make a veto or the
+// governance seat's deciding vote fail. Field contents are not inspected.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProposalModuleAdmin {
+    UpdatePreProposeInfo {},
+    AddProposalHook {},
+    RemoveProposalHook {},
+    AddVoteHook {},
+    RemoveVoteHook {},
+}
+
 fn check_contract_execute(address: &str, msg: &[u8]) -> StdResult<()> {
     if address.eq_ignore_ascii_case(GROUP) {
         require(
@@ -37,6 +50,12 @@ fn check_contract_execute(address: &str, msg: &[u8]) -> StdResult<()> {
                 GroupExecute::UpdateMembers { .. }
             ),
             "changing group administration or hooks requires governance",
+        )?;
+    }
+    if address.eq_ignore_ascii_case(PROPOSAL) {
+        require(
+            from_json::<ProposalModuleAdmin>(msg).is_err(),
+            "changing proposal module hooks or pre-propose requires governance",
         )?;
     }
     Ok(())
@@ -132,6 +151,53 @@ pub(super) fn check_messages(response: &Response) -> StdResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_messages_reserve_proposal_module_hooks_and_pre_propose() {
+        for (msg, allowed) in [
+            (r#"{"add_proposal_hook":{"address":"fixture-hook"}}"#, false),
+            (
+                r#"{"remove_proposal_hook":{"address":"fixture-hook"}}"#,
+                false,
+            ),
+            (r#"{"add_vote_hook":{"address":"fixture-hook"}}"#, false),
+            (r#"{"remove_vote_hook":{"address":"fixture-hook"}}"#, false),
+            (
+                r#"{"update_pre_propose_info":{"info":{"anyone_may_propose":{}}}}"#,
+                false,
+            ),
+            (r#"{"update_config":{"dao":"fixture-dao"}}"#, true),
+            (r#"{"execute":{"proposal_id":7}}"#, true),
+        ] {
+            let typed = WasmMsg::Execute {
+                contract_addr: PROPOSAL.to_owned(),
+                msg: Binary::from(msg.as_bytes()),
+                funds: vec![],
+            };
+            let native = MsgExecuteContract {
+                contract: PROPOSAL.to_owned(),
+                msg: msg.as_bytes().to_vec(),
+                ..Default::default()
+            };
+            assert_eq!(
+                check_messages(&Response::new().add_message(typed)).is_ok(),
+                allowed,
+                "{msg}"
+            );
+            assert_eq!(
+                check_messages(&Response::new().add_message(native)).is_ok(),
+                allowed,
+                "{msg}"
+            );
+            // The same messages sent to another contract are not this core's concern.
+            let elsewhere = WasmMsg::Execute {
+                contract_addr: "fixture-unrelated".to_owned(),
+                msg: Binary::from(msg.as_bytes()),
+                funds: vec![],
+            };
+            assert!(check_messages(&Response::new().add_message(elsewhere)).is_ok());
+        }
+    }
 
     #[test]
     fn ordinary_messages_allow_membership_updates_and_reserve_group_hooks() {

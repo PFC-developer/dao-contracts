@@ -2960,10 +2960,25 @@
                 "$ref": "#/definitions/ProposalConfig"
               },
               "expected_proposal_count": {
-                "description": "Proposal count at the review snapshot. Every proposal up to it must be resolved. Later proposals do not stop adoption, but any of them still unresolved at adoption is permanently blocked from executing.",
+                "description": "Proposal count at the review snapshot. Every proposal up to it must be resolved. Later proposals do not stop adoption, however many there are, but any of them still unresolved at adoption is permanently blocked from executing. Adoption classifies at most 512 proposals; later ones are classified afterwards, before anything executes.",
                 "type": "integer",
                 "format": "uint64",
                 "minimum": 0.0
+              },
+              "expected_proposal_hooks": {
+                "description": "Complete, reviewed lists of the proposal module's proposal hooks and vote hooks. They run on every status change and every vote, so one can make a veto or a deciding vote fail.",
+                "default": [],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "expected_vote_hooks": {
+                "default": [],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
               },
               "governance": {
                 "description": "Optional settings for the transition. Omitted values retain the original adoption path.",

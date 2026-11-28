@@ -10,9 +10,15 @@ and no ordinary transaction entry point.
   include the seat and three or four equal-weight directors. The proposal must
   be open under a three-YES absolute threshold, with neither delegation nor
   revoting enabled.
-- A completed 2–1 or 2–2 vote qualifies immediately. With four directors,
-  a partial 2–0 or 2–1 turnout qualifies after the response window. An
-  abstention never qualifies. The seat must still have its ballot available.
+- Exactly two directors must have voted YES. The proposal qualifies
+  immediately once every director has cast a ballot, and otherwise after the
+  response window, for a board of three or four directors alike. A NO, an
+  abstention and a missing ballot are treated the same: none of them can
+  withhold the deciding vote. The seat must still have its ballot available.
+- The response window is counted in blocks. Under a time-based voting
+  period nothing checks that the window ends before the proposal expires,
+  so choose a window that is safely shorter than the voting period at the
+  chain's slowest expected block time.
 - Configure the contract as the proposal module's vetoer to enable veto.
   The module applies its own veto window, status transition, and completion hooks.
   A veto does not require a voting seat.

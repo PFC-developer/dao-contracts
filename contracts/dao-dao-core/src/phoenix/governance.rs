@@ -358,7 +358,10 @@ pub(super) fn configure_voting_seat(
 ) -> StdResult<()> {
     if let Some(response_blocks) = response_blocks {
         // For height-based proposals the response window must end before the
-        // last voting block. Time-based periods depend on actual block times.
+        // last voting block. A time-based period cannot be compared with a
+        // window in blocks without assuming a block time, so it is not
+        // checked: the reviewer has to choose a window that is safely shorter
+        // than the voting period at the chain's slowest expected block time.
         if let Duration::Height(voting_blocks) = cfg.max_voting_period {
             require(
                 voting_blocks > response_blocks,

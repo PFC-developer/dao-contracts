@@ -298,17 +298,20 @@ fn check_deadlock(
         "proposal is not open under the supported voting rules",
     )?;
     // The seat has not voted, so every recorded ballot belongs to a director.
-    // A completed 2–1 or 2–2 split qualifies immediately. Otherwise the
-    // directors who have not voted get the full response window; after it,
-    // 2 YES / 1 NO / 1 silent is a deadlock just like 2 YES / 2 NO.
-    let maximum_no = weight.checked_mul(Uint128::from(directors - 2))?;
-    let complete_split = proposal.votes.no == maximum_no;
+    // Two director YES votes leave the proposal one seat short. It qualifies
+    // at once when every director has cast a ballot, and otherwise after the
+    // directors who have not voted have had the full response window. An
+    // abstention counts like a NO or a missing ballot: no director can
+    // withhold the deciding vote by the way they decline to vote YES.
+    let cast = proposal
+        .votes
+        .yes
+        .checked_add(proposal.votes.no)?
+        .checked_add(proposal.votes.abstain)?;
+    let complete = cast == weight.checked_mul(Uint128::from(directors))?;
     let elapsed = height >= proposal.start_height.saturating_add(config.response_blocks);
     require(
-        proposal.votes.yes == weight.checked_mul(Uint128::new(2))?
-            && proposal.votes.abstain.is_zero()
-            && proposal.votes.no <= maximum_no
-            && (complete_split || elapsed),
+        proposal.votes.yes == weight.checked_mul(Uint128::new(2))? && (complete || elapsed),
         "proposal is not deadlocked",
     )
 }
@@ -364,28 +367,24 @@ mod tests {
     }
 
     #[test]
-    fn completed_ballots_with_abstentions_do_not_qualify() {
+    fn completed_ballots_with_abstentions_qualify_immediately() {
         let (proposal, config) = setup(50, 0, 25);
-        assert!(check_deadlock(&proposal, 3, &config, 110).is_err());
+        assert!(check_deadlock(&proposal, 3, &config, 101).is_ok());
         let (proposal, config) = setup(50, 25, 25);
-        assert!(check_deadlock(&proposal, 4, &config, 110).is_err());
+        assert!(check_deadlock(&proposal, 4, &config, 101).is_ok());
         let (proposal, config) = setup(50, 0, 50);
-        assert!(check_deadlock(&proposal, 4, &config, 110).is_err());
+        assert!(check_deadlock(&proposal, 4, &config, 101).is_ok());
     }
 
     #[test]
-    fn partial_two_yes_one_no_waits_for_the_response_window() {
-        let (proposal, config) = setup(50, 25, 0);
-        assert!(check_deadlock(&proposal, 4, &config, 101).is_err());
-        assert!(check_deadlock(&proposal, 4, &config, 109).is_err());
-        assert!(check_deadlock(&proposal, 4, &config, 110).is_ok());
-    }
-
-    #[test]
-    fn abstentions_never_qualify_after_partial_turnout() {
-        let (proposal, config) = setup(50, 0, 25);
-        for height in [101, 109, 110, 1_000] {
-            assert!(check_deadlock(&proposal, 4, &config, height).is_err());
+    fn partial_turnout_waits_for_the_response_window() {
+        // Four directors with one ballot missing: a NO or an abstention
+        // beside the two YES votes.
+        for (no, abstain) in [(25, 0), (0, 25)] {
+            let (proposal, config) = setup(50, no, abstain);
+            assert!(check_deadlock(&proposal, 4, &config, 101).is_err());
+            assert!(check_deadlock(&proposal, 4, &config, 109).is_err());
+            assert!(check_deadlock(&proposal, 4, &config, 110).is_ok());
         }
     }
 

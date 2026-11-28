@@ -100,13 +100,22 @@ pub enum MigrateMsg {
         expected_proposal_config: ProposalConfig,
         expected_creation_policy: ProposalCreationPolicy,
         /// Proposal count at the review snapshot. Every proposal up to it must be
-        /// resolved. Later proposals do not stop adoption, but any of them still
-        /// unresolved at adoption is permanently blocked from executing.
+        /// resolved. Later proposals do not stop adoption, however many there
+        /// are, but any of them still unresolved at adoption is permanently
+        /// blocked from executing. Adoption classifies at most 512 proposals;
+        /// later ones are classified afterwards, before anything executes.
         expected_proposal_count: u64,
         /// Complete, reviewed list of hooks registered on the membership group.
         /// A hook runs on every membership change and can make it fail.
         #[serde(default)]
         expected_group_hooks: Vec<String>,
+        /// Complete, reviewed lists of the proposal module's proposal hooks and
+        /// vote hooks. They run on every status change and every vote, so one
+        /// can make a veto or a deciding vote fail.
+        #[serde(default)]
+        expected_proposal_hooks: Vec<String>,
+        #[serde(default)]
+        expected_vote_hooks: Vec<String>,
         /// Optional settings for the transition. Omitted values retain the original adoption path.
         governance: Option<GovernanceOptions>,
     },
@@ -130,6 +139,8 @@ enum ProposalQuery {
     Config {},
     ProposalCreationPolicy {},
     ProposalCount {},
+    ProposalHooks {},
+    VoteHooks {},
     Proposal {
         proposal_id: u64,
     },
@@ -178,6 +189,8 @@ struct ProposalSnapshot {
     allow_revoting: bool,
     #[cfg(feature = "phoenix-rotation")]
     expiration: cw_utils::Expiration,
+    #[cfg(feature = "phoenix-rotation")]
+    min_voting_period: Option<cw_utils::Expiration>,
 }
 
 #[derive(serde::Deserialize)]
@@ -214,6 +227,9 @@ struct GuardedBatch {
     members: Vec<cw4::Member>,
     hooks: Vec<String>,
     seated_voting_period: Option<Duration>,
+    /// The maximum and minimum voting periods while a veto is configured.
+    /// They are the window in which an open proposal can be vetoed.
+    veto_periods: Option<(Duration, Option<Duration>)>,
 }
 
 struct PlannedBoundary {
@@ -226,6 +242,9 @@ struct PlannedBoundary {
     already_indexed: Vec<u64>,
     more_staged: bool,
     settled: Vec<(u64, Option<PayloadKey>)>,
+    /// Proposals past the scan window, left for the execution hook or a
+    /// checkpoint to classify. Only adoption leaves any.
+    unscanned: u64,
 }
 
 /// The proposals a boundary reports as newly blocked.
@@ -233,6 +252,8 @@ struct Blocked {
     ids: Vec<u64>,
     /// More staged proposals were activated than the report lists.
     truncated: bool,
+    /// Proposals the boundary did not classify.
+    unscanned: u64,
 }
 
 fn require(condition: bool, message: impl Into<String>) -> StdResult<()> {
@@ -278,6 +299,30 @@ fn group_hooks(deps: Deps) -> StdResult<Vec<String>> {
     let mut hooks = response.hooks;
     hooks.sort_unstable();
     Ok(hooks)
+}
+
+fn module_hooks(deps: Deps, query: &ProposalQuery) -> StdResult<Vec<String>> {
+    let response: HooksResponse = deps.querier.query_wasm_smart(PROPOSAL, query)?;
+    let mut hooks = response.hooks;
+    hooks.sort_unstable();
+    Ok(hooks)
+}
+
+fn check_reviewed_hooks(
+    deps: Deps,
+    reviewed: &[String],
+    live: Vec<String>,
+    name: &str,
+) -> StdResult<()> {
+    let mut reviewed = reviewed
+        .iter()
+        .map(|hook| deps.api.addr_validate(hook).map(Addr::into_string))
+        .collect::<StdResult<Vec<_>>>()?;
+    reviewed.sort_unstable();
+    require(
+        live == reviewed,
+        format!("{name} hooks differ from the reviewed list"),
+    )
 }
 
 fn check_proposal_module(deps: Deps) -> StdResult<()> {
@@ -538,7 +583,27 @@ fn prune_rows(
 // Classify proposals since the last boundary. Those up to the reviewed ID
 // must be resolved. Any later unresolved proposals are gated instead, however
 // many there are, so opening proposals cannot stop a boundary from being set.
+#[cfg(feature = "phoenix-rotation")]
 fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBoundary> {
+    plan_boundary_within(deps, checked, reviewed, false)
+}
+
+// Adoption cannot be preceded by a checkpoint, so it must not fail on the
+// number of proposals: anyone can open them. It classifies one scan window,
+// which has to hold the reviewed range, and leaves the rest. Every proposal
+// it leaves was created at or before the adoption height, so the execution
+// hook and the checkpoint treat it as part of the boundary-height tail and
+// classify it before anything can execute.
+fn plan_adoption_boundary(deps: Deps, reviewed: u64) -> StdResult<PlannedBoundary> {
+    plan_boundary_within(deps, 0, reviewed, true)
+}
+
+fn plan_boundary_within(
+    deps: Deps,
+    checked: u64,
+    reviewed: u64,
+    leave_excess: bool,
+) -> StdResult<PlannedBoundary> {
     let count = proposal_count(deps)?;
     require(
         count >= reviewed,
@@ -550,12 +615,19 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
         .map_or(checked, |history| history.through.max(checked));
     #[cfg(not(feature = "phoenix-rotation"))]
     let through = checked;
-    require(
-        count
-            .checked_sub(through)
-            .is_some_and(|n| n <= MAX_PROPOSALS_TO_CHECK),
-        "proposal count exceeds the scan window; checkpoint proposal history first",
-    )?;
+    require(count >= through, "proposal count moved backwards")?;
+    let end = count.min(through.saturating_add(MAX_PROPOSALS_TO_CHECK));
+    if leave_excess {
+        require(
+            reviewed <= end,
+            "reviewed proposal count exceeds the scan window",
+        )?;
+    } else {
+        require(
+            end == count,
+            "proposal count exceeds the scan window; checkpoint proposal history first",
+        )?;
+    }
     let mut gated = Vec::new();
     let mut gate = |id| -> StdResult<()> {
         require(
@@ -589,7 +661,7 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
             settled.push((id, key));
         }
     }
-    visit_proposals(deps, through, count, |record| {
+    visit_proposals(deps, through, end, |record| {
         if !is_resolved(&record.proposal.status) {
             gate(record.id)?;
         }
@@ -620,11 +692,12 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
         }
     }
     Ok(PlannedBoundary {
-        proposal_count: count,
+        proposal_count: end,
         gated,
         already_indexed,
         more_staged,
         settled,
+        unscanned: count - end,
     })
 }
 
@@ -653,6 +726,7 @@ impl PlannedBoundary {
                 .chain(self.gated.into_iter().map(|(id, _)| id))
                 .collect(),
             truncated: self.more_staged,
+            unscanned: self.unscanned,
         })
     }
 }
@@ -664,6 +738,9 @@ fn gated_attribute(mut response: Response, blocked: &Blocked) -> Response {
     }
     if blocked.truncated {
         response = response.add_attribute("gated_proposals_truncated", "true");
+    }
+    if blocked.unscanned > 0 {
+        response = response.add_attribute("unscanned_proposals", blocked.unscanned.to_string());
     }
     response
 }
@@ -876,6 +953,10 @@ fn guard_pinned_config(deps: DepsMut, mut response: Response) -> StdResult<Respo
     let seated_voting_period =
         governance::has_seat(deps.storage, &members)?.then_some(cfg.max_voting_period);
     let hooks = group_hooks(deps.as_ref())?;
+    let veto_periods = cfg
+        .veto
+        .as_ref()
+        .map(|_| (cfg.max_voting_period, cfg.min_voting_period));
     GUARDED_BATCH.save(
         deps.storage,
         &GuardedBatch {
@@ -884,6 +965,7 @@ fn guard_pinned_config(deps: DepsMut, mut response: Response) -> StdResult<Respo
             members,
             hooks,
             seated_voting_period,
+            veto_periods,
         },
     )?;
     let last = response
@@ -915,6 +997,14 @@ pub(crate) fn guard_reply(deps: DepsMut, env: &Env, id: u64) -> StdResult<Option
         cfg.veto == batch.veto,
         "proposal veto configuration changed",
     )?;
+    // The vetoer can act while a proposal is open, so shortening the voting
+    // periods would shorten the time governance has to veto.
+    if let Some((max, min)) = batch.veto_periods {
+        require(
+            cfg.max_voting_period == max && cfg.min_voting_period == min,
+            "proposal voting periods changed under a veto",
+        )?;
+    }
     // A hook runs inside every membership update and can make it fail.
     require(
         group_hooks(deps.as_ref())? == batch.hooks,
@@ -956,6 +1046,13 @@ pub(crate) fn guard_reply(deps: DepsMut, env: &Env, id: u64) -> StdResult<Option
                 !record.proposal.allow_revoting
                     && record.proposal.expiration == period.after(&env.block),
                 format!("proposal {} saved different voting settings", record.id),
+            )?;
+        }
+        if let Some((max, min)) = batch.veto_periods {
+            require(
+                record.proposal.expiration == max.after(&env.block)
+                    && record.proposal.min_voting_period == min.map(|min| min.after(&env.block)),
+                format!("proposal {} saved different voting periods", record.id),
             )?;
         }
         Ok(())
@@ -1017,8 +1114,22 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
         expected_creation_policy,
         expected_proposal_count,
         expected_group_hooks,
+        expected_proposal_hooks,
+        expected_vote_hooks,
         governance,
     } = msg;
+    check_reviewed_hooks(
+        deps.as_ref(),
+        &expected_proposal_hooks,
+        module_hooks(deps.as_ref(), &ProposalQuery::ProposalHooks {})?,
+        "proposal",
+    )?;
+    check_reviewed_hooks(
+        deps.as_ref(),
+        &expected_vote_hooks,
+        module_hooks(deps.as_ref(), &ProposalQuery::VoteHooks {})?,
+        "vote",
+    )?;
     let mut expected_group_hooks = expected_group_hooks
         .iter()
         .map(|hook| deps.api.addr_validate(hook).map(Addr::into_string))
@@ -1057,7 +1168,7 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
             && voting.power == Uint128::from(expected_members.len() as u64 * SEAT_WEIGHT),
         "unexpected voting power",
     )?;
-    let boundary = plan_boundary(deps.as_ref(), 0, expected_proposal_count)?;
+    let boundary = plan_adoption_boundary(deps.as_ref(), expected_proposal_count)?;
     let mut changes = vec![MemberChange::Remove {
         address: outgoing.clone(),
     }];

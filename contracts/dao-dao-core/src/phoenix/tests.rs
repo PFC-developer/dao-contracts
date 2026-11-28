@@ -32,6 +32,9 @@ struct Host {
     messages: std::collections::BTreeMap<u64, Vec<CosmosMsg>>,
     /// Hooks registered on the membership group.
     hooks: Vec<String>,
+    /// Proposal hooks and vote hooks registered on the proposal module.
+    proposal_hooks: Vec<String>,
+    vote_hooks: Vec<String>,
 }
 
 fn proposal_msgs(host: &Host, id: u64) -> Vec<CosmosMsg> {
@@ -61,6 +64,8 @@ struct FullProposal<'a> {
     allow_revoting: bool,
     #[cfg(feature = "phoenix-rotation")]
     expiration: cw_utils::Expiration,
+    #[cfg(feature = "phoenix-rotation")]
+    min_voting_period: Option<cw_utils::Expiration>,
 }
 
 fn snapshot(start_height: u64, status: Status) -> ProposalSnapshot {
@@ -77,6 +82,8 @@ fn snapshot(start_height: u64, status: Status) -> ProposalSnapshot {
         allow_revoting: false,
         #[cfg(feature = "phoenix-rotation")]
         expiration: cw_utils::Expiration::Never {},
+        #[cfg(feature = "phoenix-rotation")]
+        min_voting_period: None,
     }
 }
 
@@ -133,6 +140,8 @@ fn fixture(
         expected_creation_policy: ProposalCreationPolicy::Anyone {},
         expected_proposal_count: 1,
         expected_group_hooks: vec![],
+        expected_proposal_hooks: vec![],
+        expected_vote_hooks: vec![],
         governance: None,
     };
     let host = Rc::new(RefCell::new(Host {
@@ -154,6 +163,8 @@ fn fixture(
         }],
         messages: Default::default(),
         hooks: vec![],
+        proposal_hooks: vec![],
+        vote_hooks: vec![],
     }));
     let querier_host = host.clone();
     let height = env.block.height;
@@ -237,6 +248,12 @@ fn fixture(
                 PROPOSAL => match from_json::<ProposalQuery>(msg).unwrap() {
                     ProposalQuery::Config {} => to_json_binary(&h.config),
                     ProposalQuery::ProposalCount {} => to_json_binary(&h.proposals.len()),
+                    ProposalQuery::ProposalHooks {} => to_json_binary(&HooksResponse {
+                        hooks: h.proposal_hooks.clone(),
+                    }),
+                    ProposalQuery::VoteHooks {} => to_json_binary(&HooksResponse {
+                        hooks: h.vote_hooks.clone(),
+                    }),
                     ProposalQuery::ProposalCreationPolicy {} => {
                         to_json_binary(&ProposalCreationPolicy::Anyone {})
                     }
@@ -260,6 +277,8 @@ fn fixture(
                                 allow_revoting: record.proposal.allow_revoting,
                                 #[cfg(feature = "phoenix-rotation")]
                                 expiration: record.proposal.expiration,
+                                #[cfg(feature = "phoenix-rotation")]
+                                min_voting_period: record.proposal.min_voting_period,
                             },
                         })
                     }

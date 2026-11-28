@@ -11,6 +11,8 @@ echo "generating schema for dao-dao-core"
 cd contracts/dao-dao-core
 cargo run --example schema > /dev/null
 rm -rf ./schema/raw
+# The rotation build has a sudo entry point; its schema is kept separately.
+cargo run --example schema --features phoenix-rotation > /dev/null
 cd "$START_DIR"
 
 for f in ./contracts/delegation/*

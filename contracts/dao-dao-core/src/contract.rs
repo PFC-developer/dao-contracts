@@ -29,7 +29,11 @@ use crate::state::{
 };
 
 pub(crate) const CONTRACT_NAME: &str = "crates.io:dao-dao-core";
-pub(crate) const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(not(feature = "phoenix-rotation"))]
+pub(crate) const CONTRACT_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-phoenix.4856.2");
+#[cfg(feature = "phoenix-rotation")]
+pub(crate) const CONTRACT_VERSION: &str =
+    concat!(env!("CARGO_PKG_VERSION"), "-phoenix.4856-governance");
 
 const PROPOSAL_MODULE_REPLY_ID: u64 = 0;
 const VOTE_MODULE_INSTANTIATE_REPLY_ID: u64 = 1;
@@ -133,10 +137,20 @@ pub fn execute(
 
     match msg {
         ExecuteMsg::ExecuteAdminMsgs { msgs } => {
-            execute_admin_msgs(deps.as_ref(), info.sender, msgs)
+            let response = execute_admin_msgs(deps.as_ref(), info.sender, msgs)?;
+            Ok(crate::phoenix::guard_admin_messages(
+                deps.as_ref(),
+                response,
+            )?)
         }
         ExecuteMsg::ExecuteProposalHook { msgs } => {
-            execute_proposal_hook(deps.as_ref(), info.sender, msgs)
+            let response = execute_proposal_hook(deps.as_ref(), info.sender.clone(), msgs)?;
+            Ok(crate::phoenix::gate_execution(
+                deps,
+                &env,
+                &info.sender,
+                response,
+            )?)
         }
         ExecuteMsg::Pause { duration } => execute_pause(deps, env, info.sender, duration),
         ExecuteMsg::Unpause {} => execute_unpause(deps, info.sender),
@@ -888,7 +902,7 @@ pub fn query_initial_actions(deps: Deps) -> StdResult<Binary> {
     to_json_binary(&INITIAL_ACTIONS.may_load(deps.storage)?.unwrap_or_default())
 }
 
-#[cfg_attr(not(feature = "library"), entry_point)]
+// The Phoenix entry point validates its predecessor before calling this helper.
 pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, ContractError> {
     let ContractVersion { version, .. } = get_contract_version(deps.storage)?;
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
@@ -971,7 +985,10 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> Result<Response, ContractError> {
+pub fn reply(mut deps: DepsMut, env: Env, msg: Reply) -> Result<Response, ContractError> {
+    if let Some(response) = crate::phoenix::guard_reply(deps.branch(), &env, msg.id)? {
+        return Ok(response);
+    }
     match msg.id {
         PROPOSAL_MODULE_REPLY_ID => {
             let res = parse_reply_instantiate_data(msg)?;
@@ -1000,9 +1017,15 @@ pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> Result<Response, ContractE
                 None => vec![],
             };
 
-            Ok(Response::default()
+            // A new module chooses these messages and the core dispatches
+            // them, so they get the same check as a proposal's own messages.
+            let response = Response::default()
                 .add_attribute("prop_module".to_string(), res.contract_address)
-                .add_messages(callback_msgs))
+                .add_messages(callback_msgs);
+            Ok(crate::phoenix::guard_admin_messages(
+                deps.as_ref(),
+                response,
+            )?)
         }
 
         VOTE_MODULE_INSTANTIATE_REPLY_ID => {

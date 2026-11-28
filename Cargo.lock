@@ -1708,6 +1708,8 @@ dependencies = [
  "cw2 1.1.2",
  "cw20 1.1.2",
  "cw20-base 1.1.2",
+ "cw4 1.1.2",
+ "cw4-group 1.1.2",
  "cw721 0.18.0",
  "cw721-base 0.18.0",
  "dao-dao-core 2.7.1",
@@ -1715,7 +1717,11 @@ dependencies = [
  "dao-interface 2.7.1",
  "dao-proposal-sudo",
  "dao-testing",
+ "dao-voting 2.7.1",
  "dao-voting-cw20-balance",
+ "osmosis-std",
+ "serde",
+ "sha2 0.10.8",
  "thiserror",
 ]
 
@@ -1743,6 +1749,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "dao-governance-seat"
+version = "2.7.1"
+dependencies = [
+ "cosmwasm-schema",
+ "cosmwasm-std",
+ "cw-storage-plus 1.2.0",
+ "cw2 1.1.2",
+ "cw4 1.1.2",
+ "dao-interface 2.7.1",
+ "dao-voting 2.7.1",
+ "serde",
 ]
 
 [[package]]

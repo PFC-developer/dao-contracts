@@ -32,7 +32,13 @@ fn msgs_of(host: &Rc<RefCell<Host>>, id: u64) -> Vec<CosmosMsg> {
 fn gated(deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>) -> Vec<u64> {
     let mut ids: Vec<u64> = GATED
         .range(&deps.storage, None, None, Order::Ascending)
-        .flat_map(|entry| entry.unwrap().1)
+        .map(|entry| entry.unwrap().0 .1)
+        .filter(|&id| {
+            id <= BOUNDARY
+                .may_load(&deps.storage)
+                .unwrap()
+                .map_or(0, |b| b.proposal_count)
+        })
         .collect();
     ids.sort_unstable();
     ids
@@ -181,6 +187,24 @@ fn proposal_without_messages_is_reported_but_never_filed() {
     env.block.height += 1;
     set_status(&host, empty, Status::Executed);
     assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+}
+
+#[test]
+fn proposal_payload_must_be_verified_before_a_boundary_can_commit() {
+    let (mut deps, env, host, payload) = fixture(4);
+    let id = push(&host, env.block.height - 1, Status::Open);
+    host.borrow_mut().extra = Some(Box::new(move |query| match query {
+        WasmQuery::Smart { contract_addr, msg }
+            if contract_addr == PROPOSAL
+                && from_json::<ProposalQuery>(msg).ok()
+                    == Some(ProposalQuery::Proposal { proposal_id: id }) =>
+        {
+            Some(Binary::from(br#"{"id":2,"proposal":{}}"#.as_slice()))
+        }
+        _ => None,
+    }));
+    assert!(migrate(deps.as_mut(), env, payload).is_err());
+    assert!(BOUNDARY.may_load(&deps.storage).unwrap().is_none());
 }
 
 #[test]
@@ -772,8 +796,7 @@ fn checkpoint_handles_large_history_without_changing_execution_eligibility() {
     assert!(gated(&deps).is_empty());
 
     // A staged proposal can execute until a boundary makes it stale.
-    let messages = fixture_msg("still eligible");
-    set_msgs(&host, open, &messages);
+    let messages = msgs_of(&host, open);
     set_status(&host, open, Status::Executed);
     hook(deps.as_mut(), &env, &messages).unwrap();
     finish_guard(deps.as_mut(), &env).unwrap();
@@ -786,6 +809,92 @@ fn checkpoint_handles_large_history_without_changing_execution_eligibility() {
     assert_eq!(cursor(&deps), count as u64);
     assert_eq!(gated(&deps), vec![second]);
     assert!(PENDING_HISTORY.may_load(&deps.storage).unwrap().is_none());
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn long_unresolved_checkpoint_history_activates_at_a_membership_boundary() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    for _ in 0..MAX_PROPOSALS_TO_CHECK + 36 {
+        push(&host, env.block.height, Status::Open);
+    }
+    let count = host.borrow().proposals.len() as u64;
+    for _ in 0..count.div_ceil(PROPOSALS_PER_CHECKPOINT) {
+        sudo(
+            deps.as_mut(),
+            env.clone(),
+            SudoMsg::CheckpointProposalHistory {},
+        )
+        .unwrap();
+    }
+    assert!(gated(&deps).is_empty());
+    sudo(
+        deps.as_mut(),
+        env.clone(),
+        SudoMsg::UpdateMembership {
+            expected_members: host.borrow().members.clone(),
+            expected_proposal_count: 1,
+            changes: swap_member(),
+        },
+    )
+    .unwrap();
+    assert_eq!(cursor(&deps), count);
+    assert_eq!(gated(&deps).len() as u64, count - 1);
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn checkpoint_prunes_settled_entries_from_an_oversized_payload_bucket() {
+    let shared = fixture_msg("shared");
+    let (mut deps, mut env, host) = settled(&[]);
+    for _ in 0..=MAX_GATED_PER_PAYLOAD {
+        let id = push(&host, env.block.height, Status::Open);
+        set_msgs(&host, id, &shared);
+    }
+    env.block.height += 1;
+    sudo(
+        deps.as_mut(),
+        env.clone(),
+        SudoMsg::CheckpointProposalHistory {},
+    )
+    .unwrap();
+    sudo(
+        deps.as_mut(),
+        env.clone(),
+        SudoMsg::CheckpointProposalHistory {},
+    )
+    .unwrap();
+    assert!(hook(deps.as_mut(), &env, &shared).is_err());
+    set_status(&host, 2, Status::Closed);
+    for _ in 0..3 {
+        sudo(
+            deps.as_mut(),
+            env.clone(),
+            SudoMsg::CheckpointProposalHistory {},
+        )
+        .unwrap();
+    }
+    assert!(hook(deps.as_mut(), &env, &shared).is_ok());
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn checkpoint_advances_a_long_boundary_height_tail() {
+    let (mut deps, mut env, host) = settled(&[]);
+    for _ in 0..MAX_PROPOSALS_TO_CHECK + 1 {
+        push(&host, env.block.height, Status::Open);
+    }
+    env.block.height += 1;
+    sudo(
+        deps.as_mut(),
+        env.clone(),
+        SudoMsg::CheckpointProposalHistory {},
+    )
+    .unwrap();
+    assert_eq!(cursor(&deps), 1 + PROPOSALS_PER_CHECKPOINT);
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+    assert_eq!(cursor(&deps), MAX_PROPOSALS_TO_CHECK + 2);
 }
 
 #[test]
@@ -944,6 +1053,34 @@ fn governance_send_that_changes_the_roster_sets_a_boundary() {
         (boundary.height, boundary.proposal_count),
         (env.block.height, open)
     );
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn governance_send_detects_weight_changes_on_later_roster_pages() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    let open = push(&host, env.block.height, Status::Open);
+    env.block.height += 1;
+    host.borrow_mut().members = (0..32)
+        .map(|i| Member {
+            addr: format!("fixture-member-{i:02}"),
+            weight: SEAT_WEIGHT,
+        })
+        .collect();
+    governance::set_send_enabled(&mut deps.storage, env.block.time, true).unwrap();
+    env.block.time = env.block.time.plus_seconds(48 * 60 * 60);
+    governance::send_as_dao(
+        deps.as_mut(),
+        env.block.time,
+        fixture_msg("governance send"),
+    )
+    .unwrap();
+    host.borrow_mut().members[30].weight += 1;
+    host.borrow_mut().members[31].weight -= 1;
+    let response = governance::send_reply(deps.as_mut(), &env).unwrap();
+    assert_eq!(attribute(&response, "gated_proposals"), Some("2"));
+    assert_eq!(gated(&deps), vec![open]);
 }
 
 #[cfg(feature = "phoenix-rotation")]

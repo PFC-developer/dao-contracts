@@ -205,14 +205,19 @@ fn fixture(
                     Cw4QueryMsg::Admin {} => to_json_binary(&AdminResponse {
                         admin: Some(h.group_admin.clone()),
                     }),
-                    Cw4QueryMsg::ListMembers { limit, .. } => to_json_binary(&MemberListResponse {
-                        members: h
-                            .members
-                            .iter()
-                            .take(limit.unwrap_or(10) as usize)
-                            .cloned()
-                            .collect(),
-                    }),
+                    Cw4QueryMsg::ListMembers { limit, start_after } => {
+                        let mut members = h.members.clone();
+                        members.sort_unstable_by(|a, b| a.addr.cmp(&b.addr));
+                        to_json_binary(&MemberListResponse {
+                            members: members
+                                .into_iter()
+                                .skip_while(|m| {
+                                    start_after.as_ref().is_some_and(|after| m.addr <= *after)
+                                })
+                                .take(limit.unwrap_or(10) as usize)
+                                .collect(),
+                        })
+                    }
                     Cw4QueryMsg::TotalWeight { .. } => to_json_binary(&TotalWeightResponse {
                         weight: h.members.iter().map(|m| m.weight).sum(),
                     }),

@@ -11,12 +11,13 @@ use cw4::{
     TotalWeightResponse,
 };
 use cw4_group::msg::ExecuteMsg as GroupExecute;
-use cw_storage_plus::{Item, Map};
+use cw_storage_plus::{Bound, Item, Map};
 use cw_utils::Duration;
 use dao_interface::{msg::MigrateMsg as UpstreamMigrate, state::ProposalModuleStatus, voting};
 use dao_voting::{
     pre_propose::ProposalCreationPolicy, status::Status, threshold::Threshold, veto::VetoConfig,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     contract,
@@ -68,9 +69,14 @@ const BOUNDARY: Item<SnapshotBoundary> = Item::new("phoenix_snapshot_boundary_v1
 /// entry for its own messages, however many proposals are blocked in total.
 /// Keys come from this build's encoding of the messages, so a successor build
 /// must keep that encoding or refile the entries.
-const GATED: Map<u64, Vec<u64>> = Map::new("phoenix_gated_messages_v1");
+type PayloadKey = [u8; 32];
+const GATED: Map<(&[u8], u64), ()> = Map::new("phoenix_gated_messages_v2");
+/// Rows beyond the boundary are staged by checkpointing and do not gate execution.
+const INDEXED: Map<u64, Option<PayloadKey>> = Map::new("phoenix_indexed_proposals_v2");
 #[cfg(feature = "phoenix-rotation")]
-const PENDING_HISTORY: Item<PendingHistory> = Item::new("phoenix_pending_history_v1");
+const PRUNE_CURSOR: Item<u64> = Item::new("phoenix_proposal_prune_cursor_v2");
+#[cfg(feature = "phoenix-rotation")]
+const PENDING_HISTORY: Item<PendingHistory> = Item::new("phoenix_pending_history_v2");
 #[cfg(feature = "phoenix-rotation")]
 const GUARDED_BATCH: Item<GuardedBatch> = Item::new("phoenix_guarded_batch_v1");
 
@@ -170,9 +176,9 @@ struct ProposalSnapshot {
     expiration: cw_utils::Expiration,
 }
 
-// Decoded only for a proposal the module reports as executed.
 #[derive(serde::Deserialize)]
 struct ExecutedRecord {
+    id: u64,
     proposal: ExecutedSnapshot,
 }
 
@@ -194,7 +200,6 @@ struct SnapshotBoundary {
 #[cw_serde]
 struct PendingHistory {
     through: u64,
-    unresolved: Vec<u64>,
 }
 
 #[cfg(feature = "phoenix-rotation")]
@@ -211,7 +216,9 @@ struct PlannedBoundary {
     proposal_count: u64,
     /// Newly blocked proposals with the key their messages are filed under.
     /// A proposal whose messages can never reach the core has no key.
-    gated: Vec<(u64, Option<u64>)>,
+    gated: Vec<(u64, Option<PayloadKey>)>,
+    already_indexed: Vec<u64>,
+    settled: Vec<(u64, Option<PayloadKey>)>,
 }
 
 fn require(condition: bool, message: impl Into<String>) -> StdResult<()> {
@@ -391,90 +398,100 @@ fn visit_proposals(
 }
 
 #[cfg(feature = "phoenix-rotation")]
-fn keep_unresolved(deps: Deps, ids: impl IntoIterator<Item = u64>) -> StdResult<Vec<u64>> {
-    let mut unresolved = Vec::new();
-    for id in ids {
-        if !is_resolved(&load_proposal(deps, id)?.status) {
-            unresolved.push(id);
-        }
-    }
-    Ok(unresolved)
-}
-
-#[cfg(feature = "phoenix-rotation")]
-fn pending_history(deps: Deps, checked: u64) -> StdResult<PendingHistory> {
-    let history = PENDING_HISTORY
+fn checkpoint_history(mut deps: DepsMut, boundary: &SnapshotBoundary) -> StdResult<Response> {
+    prune_resolved(deps.branch())?;
+    let through = PENDING_HISTORY
         .may_load(deps.storage)?
-        .unwrap_or(PendingHistory {
-            through: checked,
-            unresolved: vec![],
+        .map_or(boundary.proposal_count, |history| {
+            history.through.max(boundary.proposal_count)
         });
-    // The execution hook can separately classify the boundary-height tail.
-    Ok(PendingHistory {
-        through: history.through.max(checked),
-        unresolved: keep_unresolved(
-            deps,
-            history.unresolved.into_iter().filter(|&id| id > checked),
-        )?,
-    })
-}
-
-#[cfg(feature = "phoenix-rotation")]
-fn checkpoint_history(deps: DepsMut, boundary: &SnapshotBoundary) -> StdResult<Response> {
-    let mut history = pending_history(deps.as_ref(), boundary.proposal_count)?;
     let count = proposal_count(deps.as_ref())?;
-    require(count >= history.through, "proposal count moved backwards")?;
-    let end = count.min(history.through.saturating_add(PROPOSALS_PER_CHECKPOINT));
-    visit_proposals(deps.as_ref(), history.through, end, |record| {
+    require(count >= through, "proposal count moved backwards")?;
+    let end = count.min(through.saturating_add(PROPOSALS_PER_CHECKPOINT));
+    let mut tail = boundary.proposal_count;
+    let mut staged = Vec::new();
+    visit_proposals(deps.as_ref(), through, end, |record| {
+        if record.proposal.start_height <= boundary.height {
+            tail = record.id;
+        }
         if !is_resolved(&record.proposal.status) {
-            history.unresolved.push(record.id);
+            staged.push((record.id, gate_key(deps.as_ref(), record.id)?));
         }
         Ok(())
     })?;
-    history.through = end;
-    PENDING_HISTORY.save(deps.storage, &history)?;
+    for (id, key) in staged {
+        file_gated(deps.storage, id, key)?;
+    }
+    if tail > boundary.proposal_count {
+        BOUNDARY.save(
+            deps.storage,
+            &SnapshotBoundary {
+                height: boundary.height,
+                proposal_count: tail,
+            },
+        )?;
+    }
+    PENDING_HISTORY.save(deps.storage, &PendingHistory { through: end })?;
     Ok(Response::new()
         .add_attribute("action", "checkpoint_proposal_history")
         .add_attribute("checked_through", end.to_string())
         .add_attribute("proposal_count", count.to_string()))
 }
 
-// FNV-1a over the core's own encoding of the messages. A collision only adds
-// a candidate; a candidate is refused after its stored messages are compared.
-fn payload_key<'a>(msgs: impl IntoIterator<Item = &'a CosmosMsg<Empty>>) -> StdResult<u64> {
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for msg in msgs {
-        for byte in to_json_vec(msg)? {
-            hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
-        }
-        // Separate messages so that their boundaries affect the key.
-        hash = (hash ^ 0xff).wrapping_mul(PRIME);
-    }
-    Ok(hash)
+fn payload_key<'a>(msgs: impl IntoIterator<Item = &'a CosmosMsg<Empty>>) -> StdResult<PayloadKey> {
+    let messages: Vec<_> = msgs.into_iter().collect();
+    Ok(Sha256::digest(to_json_vec(&messages)?).into())
 }
 
-// The key a blocked proposal is filed under, or none when its messages can
-// never reach the execution hook: the module does not call the core for a
-// proposal without messages, and the hook decodes messages through this same
-// type, so messages that do not decode here cannot be dispatched either.
-fn gate_key(deps: Deps, id: u64) -> StdResult<Option<u64>> {
-    let record = deps
+fn load_messages(deps: Deps, id: u64) -> StdResult<Vec<CosmosMsg<Empty>>> {
+    let record: ExecutedRecord = deps
         .querier
-        .query_wasm_smart::<ExecutedRecord>(PROPOSAL, &ProposalQuery::Proposal { proposal_id: id });
-    match record {
-        Ok(record) if !record.proposal.msgs.is_empty() => {
-            payload_key(&record.proposal.msgs).map(Some)
-        }
-        _ => Ok(None),
-    }
+        .query_wasm_smart(PROPOSAL, &ProposalQuery::Proposal { proposal_id: id })?;
+    require(record.id == id, "unexpected proposal record")?;
+    Ok(record.proposal.msgs)
 }
 
-fn file_gated(storage: &mut dyn Storage, key: u64, id: u64) -> StdResult<()> {
-    let mut ids = GATED.may_load(storage, key)?.unwrap_or_default();
-    if !ids.contains(&id) {
-        ids.push(id);
-        GATED.save(storage, key, &ids)?;
+// Only a verified empty batch can be omitted from the message index.
+fn gate_key(deps: Deps, id: u64) -> StdResult<Option<PayloadKey>> {
+    let msgs = load_messages(deps, id)?;
+    if msgs.is_empty() {
+        return Ok(None);
+    }
+    payload_key(&msgs).map(Some)
+}
+
+fn file_gated(storage: &mut dyn Storage, id: u64, key: Option<PayloadKey>) -> StdResult<()> {
+    if let Some(key) = key {
+        GATED.save(storage, (&key, id), &())?;
+    }
+    INDEXED.save(storage, id, &key)
+}
+
+fn remove_indexed(storage: &mut dyn Storage, id: u64, key: Option<PayloadKey>) {
+    if let Some(key) = key {
+        GATED.remove(storage, (&key, id));
+    }
+    INDEXED.remove(storage, id);
+}
+
+// Checkpoint callbacks run as native governance, outside a proposal hook.
+// They can retire settled duplicates without attempting another execution.
+#[cfg(feature = "phoenix-rotation")]
+fn prune_resolved(deps: DepsMut) -> StdResult<()> {
+    let start = PRUNE_CURSOR.may_load(deps.storage)?.map(Bound::exclusive);
+    let entries = INDEXED
+        .range(deps.storage, start, None, Order::Ascending)
+        .take(PROPOSALS_PER_CHECKPOINT as usize)
+        .collect::<StdResult<Vec<_>>>()?;
+    for &(id, key) in &entries {
+        if is_resolved(&load_proposal(deps.as_ref(), id)?.status) {
+            remove_indexed(deps.storage, id, key);
+        }
+    }
+    if entries.len() == PROPOSALS_PER_CHECKPOINT as usize {
+        PRUNE_CURSOR.save(deps.storage, &entries.last().unwrap().0)?;
+    } else {
+        PRUNE_CURSOR.remove(deps.storage);
     }
     Ok(())
 }
@@ -489,15 +506,14 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
         "proposal count is below the reviewed count",
     )?;
     #[cfg(feature = "phoenix-rotation")]
-    let (checked, staged) = {
-        let history = pending_history(deps, checked)?;
-        (history.through, history.unresolved)
-    };
+    let through = PENDING_HISTORY
+        .may_load(deps.storage)?
+        .map_or(checked, |history| history.through.max(checked));
     #[cfg(not(feature = "phoenix-rotation"))]
-    let staged: Vec<u64> = vec![];
+    let through = checked;
     require(
         count
-            .checked_sub(checked)
+            .checked_sub(through)
             .is_some_and(|n| n <= MAX_PROPOSALS_TO_CHECK),
         "proposal count exceeds the scan window; checkpoint proposal history first",
     )?;
@@ -510,18 +526,56 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
         gated.push((id, gate_key(deps, id)?));
         Ok(())
     };
-    for id in staged {
-        gate(id)?;
+    let mut settled = Vec::new();
+    let staged_review_end = through.min(reviewed);
+    if staged_review_end > checked {
+        for (offset, entry) in INDEXED
+            .range(
+                deps.storage,
+                Some(Bound::exclusive(checked)),
+                Some(Bound::inclusive(staged_review_end)),
+                Order::Ascending,
+            )
+            .take(PROPOSALS_PER_QUERY as usize + 1)
+            .enumerate()
+        {
+            require(
+                offset < PROPOSALS_PER_QUERY as usize,
+                "checkpoint proposal history to clear settled reviewed entries",
+            )?;
+            let (id, key) = entry?;
+            if !is_resolved(&load_proposal(deps, id)?.status) {
+                gate(id)?;
+            }
+            settled.push((id, key));
+        }
     }
-    visit_proposals(deps, checked, count, |record| {
+    visit_proposals(deps, through, count, |record| {
         if !is_resolved(&record.proposal.status) {
             gate(record.id)?;
         }
         Ok(())
     })?;
+    // Staged entries already have message keys. Report a bounded list and
+    // activate every staged row by committing the new proposal count.
+    let already_indexed = if through > checked.max(reviewed) {
+        INDEXED
+            .keys(
+                deps.storage,
+                Some(Bound::exclusive(checked.max(reviewed))),
+                Some(Bound::inclusive(through)),
+                Order::Ascending,
+            )
+            .take(PROPOSALS_PER_QUERY as usize)
+            .collect::<StdResult<Vec<_>>>()?
+    } else {
+        vec![]
+    };
     Ok(PlannedBoundary {
         proposal_count: count,
         gated,
+        already_indexed,
+        settled,
     })
 }
 
@@ -530,10 +584,11 @@ impl PlannedBoundary {
     fn save(self, storage: &mut dyn Storage, height: u64) -> StdResult<Vec<u64>> {
         #[cfg(feature = "phoenix-rotation")]
         PENDING_HISTORY.remove(storage);
+        for (id, key) in self.settled {
+            remove_indexed(storage, id, key);
+        }
         for &(id, key) in &self.gated {
-            if let Some(key) = key {
-                file_gated(storage, key, id)?;
-            }
+            file_gated(storage, id, key)?;
         }
         BOUNDARY.save(
             storage,
@@ -542,7 +597,11 @@ impl PlannedBoundary {
                 proposal_count: self.proposal_count,
             },
         )?;
-        Ok(self.gated.into_iter().map(|(id, _)| id).collect())
+        Ok(self
+            .already_indexed
+            .into_iter()
+            .chain(self.gated.into_iter().map(|(id, _)| id))
+            .collect())
     }
 }
 
@@ -565,10 +624,8 @@ fn stays_gated(deps: Deps, id: u64, status: &Status, hook: &[SubMsg]) -> StdResu
     match status {
         Status::Rejected | Status::Closed | Status::ExecutionFailed | Status::Vetoed => Ok(false),
         Status::Executed => {
-            let record: ExecutedRecord = deps
-                .querier
-                .query_wasm_smart(PROPOSAL, &ProposalQuery::Proposal { proposal_id: id })?;
-            let running = record.proposal.msgs.iter().eq(hook.iter().map(|m| &m.msg));
+            let msgs = load_messages(deps, id)?;
+            let running = msgs.iter().eq(hook.iter().map(|m| &m.msg));
             require(
                 !running,
                 format!("proposal {id} predates the current membership and cannot execute"),
@@ -631,9 +688,8 @@ pub(crate) fn gate_execution(
                 &record.proposal.status,
                 &response.messages,
             )? {
-                if let Some(key) = gate_key(deps.as_ref(), record.id)? {
-                    file_gated(deps.storage, key, record.id)?;
-                }
+                let key = gate_key(deps.as_ref(), record.id)?;
+                file_gated(deps.storage, record.id, key)?;
             }
         }
         if !full {
@@ -652,22 +708,44 @@ pub(crate) fn gate_execution(
     }
     // Only blocked proposals that carry these messages can be the one running.
     let key = payload_key(response.messages.iter().map(|m| &m.msg))?;
-    if let Some(stored) = GATED.may_load(deps.storage, key)? {
-        require(
-            stored.len() <= MAX_GATED_PER_PAYLOAD,
-            "too many blocked proposals carry these messages",
-        )?;
-        let mut gated = Vec::with_capacity(stored.len());
-        for &id in &stored {
-            let proposal = load_proposal(deps.as_ref(), id)?;
-            if stays_gated(deps.as_ref(), id, &proposal.status, &response.messages)? {
-                gated.push(id);
-            }
+    let candidates = GATED
+        .prefix(&key)
+        .keys(
+            deps.storage,
+            None,
+            Some(Bound::inclusive(cursor)),
+            Order::Ascending,
+        )
+        .take(MAX_GATED_PER_PAYLOAD + 1)
+        .collect::<StdResult<Vec<_>>>()?;
+    require(
+        candidates.len() <= MAX_GATED_PER_PAYLOAD,
+        "too many blocked proposals carry these messages",
+    )?;
+    for id in candidates {
+        let proposal = load_proposal(deps.as_ref(), id)?;
+        if !stays_gated(deps.as_ref(), id, &proposal.status, &response.messages)? {
+            remove_indexed(deps.storage, id, Some(key));
         }
-        if gated.is_empty() {
-            GATED.remove(deps.storage, key);
-        } else if gated != stored {
-            GATED.save(deps.storage, key, &gated)?;
+    }
+    #[cfg(feature = "phoenix-rotation")]
+    if PENDING_HISTORY.may_load(deps.storage)?.is_some() {
+        // Staged proposals can still execute. Retire their rows when they
+        // settle so a later boundary does not activate an executed entry.
+        let staged = GATED
+            .prefix(&key)
+            .keys(
+                deps.storage,
+                Some(Bound::exclusive(cursor)),
+                None,
+                Order::Ascending,
+            )
+            .take(PROPOSALS_PER_QUERY as usize)
+            .collect::<StdResult<Vec<_>>>()?;
+        for id in staged {
+            if is_resolved(&load_proposal(deps.as_ref(), id)?.status) {
+                remove_indexed(deps.storage, id, Some(key));
+            }
         }
     }
     guard_pinned_config(deps, response)

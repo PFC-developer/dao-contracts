@@ -1,4 +1,4 @@
-use cosmwasm_std::{Binary, CosmosMsg, Response, StdError, StdResult, WasmMsg};
+use cosmwasm_std::{from_json, Binary, CosmosMsg, Response, StdError, StdResult, WasmMsg};
 use osmosis_std::types::{
     cosmos::authz::v1beta1::{GenericAuthorization, MsgExec, MsgGrant},
     cosmwasm::wasm::v1::{
@@ -7,7 +7,7 @@ use osmosis_std::types::{
     },
 };
 
-use super::{require, CORE, GROUP, PROPOSAL, VOTING};
+use super::{require, GroupExecute, CORE, GROUP, PROPOSAL, VOTING};
 
 fn companion(address: &str) -> bool {
     [GROUP, PROPOSAL, VOTING]
@@ -27,6 +27,19 @@ fn grant_wasm_authority(address: &str) -> StdResult<()> {
         !companion(address) && !address.eq_ignore_ascii_case(CORE),
         "delegating protected contract authority requires governance",
     )
+}
+
+fn check_contract_execute(address: &str, msg: &[u8]) -> StdResult<()> {
+    if address.eq_ignore_ascii_case(GROUP) {
+        require(
+            matches!(
+                from_json::<GroupExecute>(msg)?,
+                GroupExecute::UpdateMembers { .. }
+            ),
+            "changing group administration or hooks requires governance",
+        )?;
+    }
+    Ok(())
 }
 
 fn check_grant(value: Binary) -> StdResult<()> {
@@ -73,6 +86,10 @@ fn check_native(type_url: &str, value: Binary, wrapped: bool) -> StdResult<()> {
         MsgUpdateAdmin::TYPE_URL => {
             change_admin_or_code(&MsgUpdateAdmin::try_from(value)?.contract)
         }
+        MsgExecuteContract::TYPE_URL => {
+            let msg = MsgExecuteContract::try_from(value)?;
+            check_contract_execute(&msg.contract, &msg.msg)
+        }
         MsgGrant::TYPE_URL => check_grant(value),
         MsgExec::TYPE_URL => {
             require(
@@ -98,6 +115,11 @@ pub(super) fn check_messages(response: &Response) -> StdResult<()> {
                 | WasmMsg::UpdateAdmin { contract_addr, .. }
                 | WasmMsg::ClearAdmin { contract_addr },
             ) => change_admin_or_code(contract_addr)?,
+            CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr, msg, ..
+            }) => {
+                check_contract_execute(contract_addr, msg.as_slice())?;
+            }
             CosmosMsg::Stargate { type_url, value } => {
                 check_native(type_url, value.clone(), false)?
             }
@@ -110,6 +132,52 @@ pub(super) fn check_messages(response: &Response) -> StdResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_messages_allow_membership_updates_and_reserve_group_hooks() {
+        use cosmwasm_std::to_json_binary;
+        for (msg, allowed) in [
+            (
+                GroupExecute::UpdateMembers {
+                    add: vec![],
+                    remove: vec![],
+                },
+                true,
+            ),
+            (
+                GroupExecute::AddHook {
+                    addr: "fixture-hook".to_owned(),
+                },
+                false,
+            ),
+            (
+                GroupExecute::RemoveHook {
+                    addr: "fixture-hook".to_owned(),
+                },
+                false,
+            ),
+        ] {
+            let msg = to_json_binary(&msg).unwrap();
+            let typed = WasmMsg::Execute {
+                contract_addr: GROUP.to_owned(),
+                msg: msg.clone(),
+                funds: vec![],
+            };
+            let native = MsgExecuteContract {
+                contract: GROUP.to_owned(),
+                msg: msg.to_vec(),
+                ..Default::default()
+            };
+            assert_eq!(
+                check_messages(&Response::new().add_message(typed)).is_ok(),
+                allowed
+            );
+            assert_eq!(
+                check_messages(&Response::new().add_message(native)).is_ok(),
+                allowed
+            );
+        }
+    }
 
     #[test]
     fn ordinary_dispatch_preserves_companion_administration() {

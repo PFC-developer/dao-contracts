@@ -100,10 +100,9 @@ The governance build reserves administration of its pinned voting, group,
 and proposal contracts for governance. Ordinary proposals can still dispatch
 messages to those contracts through their existing execute interfaces. The
 same check applies to the callback messages of a proposal module that an
-ordinary proposal adds. Ordinary proposals cannot change the hooks registered
-on the membership group, because a hook runs inside every membership update
-and can make it fail. Adoption takes the reviewed list of group hooks and
-fails if the live list differs.
+ordinary proposal adds. The dispatch check reserves membership group hooks
+and its internal admin for governance. Adoption takes the reviewed list
+of group hooks and fails if the live list differs.
 
 These controls bind only once governance is the core's host admin. With
 `KeepCurrentAdmin` the core stays its own admin and the DAO keeps upgrade
@@ -112,12 +111,19 @@ admin and remove every control. Use `GovernanceOnly`, or have governance
 call `SetMigrationAdmin` after adoption.
 
 A proposal that is unresolved when membership changes can no longer
-execute. That holds for the membership actions, for a roster change made by
-an ordinary proposal, and for a roster change made through send-as-DAO.
+dispatch its messages. That holds for the membership actions, for a roster
+change made by an ordinary proposal, and for a roster change made through
+send-as-DAO.
 Any number of proposals can be blocked this way. A membership change scans
 at most 512 proposals created since the previous one. Past that, every
 membership change fails, including one made by an ordinary proposal, until
-governance has run `CheckpointProposalHistory` over the backlog.
+governance has run `CheckpointProposalHistory` over the backlog. In the
+governance build the checkpoint also advances a long same-block tail and
+prunes settled entries in bounded batches. If more than 64 blocked
+proposals share a payload, execution of that payload waits until enough
+entries settle and are pruned. Staged entries after the boundary still
+execute under their current roster. A boundary event reports newly scanned
+IDs and a bounded list of IDs staged by checkpointing.
 
 The two builds are alternatives. Each one's `migrate` accepts only the
 unmigrated upstream 2.4.0 core, and runs once. A core adopted with the

@@ -14,7 +14,7 @@ pub(super) const MAX_REPAIR_MEMBERS: usize = MAX_MEMBERS + MAX_MEMBERSHIP_CHANGE
 const SEND_ACTIVE_AT: Item<Timestamp> = Item::new("governance_send_active_at");
 /// The roster before a governance send, held until its last message completes.
 #[cfg(feature = "phoenix-rotation")]
-const SEND_ROSTER: Item<Vec<Member>> = Item::new("governance_send_roster");
+const SEND_ROSTER: Item<PayloadKey> = Item::new("governance_send_roster_v2");
 // The group returns at most this many members per page.
 #[cfg(feature = "phoenix-rotation")]
 const ROSTER_PAGE: u32 = 30;
@@ -208,15 +208,28 @@ pub(super) fn set_seat(deps: DepsMut, seat: Option<GovernanceSeat>) -> StdResult
 // The send path must work on a roster that needs repair, so this neither
 // validates the roster nor rejects an oversized one.
 #[cfg(feature = "phoenix-rotation")]
-fn roster_page(deps: Deps) -> StdResult<Vec<Member>> {
-    let roster: MemberListResponse = deps.querier.query_wasm_smart(
-        GROUP,
-        &Cw4QueryMsg::ListMembers {
-            start_after: None,
-            limit: Some(ROSTER_PAGE),
-        },
-    )?;
-    Ok(roster.members)
+fn roster_fingerprint(deps: Deps) -> StdResult<PayloadKey> {
+    let mut start_after: Option<String> = None;
+    let mut digest = Sha256::new();
+    loop {
+        let roster: MemberListResponse = deps.querier.query_wasm_smart(
+            GROUP,
+            &Cw4QueryMsg::ListMembers {
+                start_after: start_after.clone(),
+                limit: Some(ROSTER_PAGE),
+            },
+        )?;
+        digest.update(to_json_vec(&roster.members)?);
+        if roster.members.len() < ROSTER_PAGE as usize {
+            return Ok(digest.finalize().into());
+        }
+        let next = &roster.members.last().expect("full roster page").addr;
+        require(
+            start_after.as_ref() < Some(next),
+            "membership pagination did not advance",
+        )?;
+        start_after = Some(next.clone());
+    }
 }
 
 /// Dispatch governance's messages as the DAO. A reply after the last message
@@ -234,7 +247,7 @@ pub(super) fn send_as_dao(
         "governance send is disabled or pending",
     )?;
     require(!msgs.is_empty(), "expected at least one message")?;
-    let roster = roster_page(deps.as_ref())?;
+    let roster = roster_fingerprint(deps.as_ref())?;
     SEND_ROSTER.save(deps.storage, &roster)?;
     let mut response = Response::new()
         .add_attribute("action", "governance_send")
@@ -254,7 +267,7 @@ pub(super) fn send_as_dao(
 pub(super) fn send_reply(deps: DepsMut, env: &Env) -> StdResult<Response> {
     let before = SEND_ROSTER.load(deps.storage)?;
     SEND_ROSTER.remove(deps.storage);
-    if roster_page(deps.as_ref())? == before {
+    if roster_fingerprint(deps.as_ref())? == before {
         return Ok(Response::new());
     }
     let boundary = BOUNDARY.load(deps.storage)?;

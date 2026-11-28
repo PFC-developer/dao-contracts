@@ -2920,7 +2920,7 @@
   "migrate": {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "title": "MigrateMsg",
-    "description": "This contract is built in two forms: the default build, and the build with the `phoenix-rotation` feature, which adds the host-authorized governance controls. They are alternative adoption targets. Each accepts only the unmigrated upstream 2.4.0 core as its predecessor, so a core adopted with the default build cannot migrate to the governance build. Adding the controls later needs a new, separately reviewed build.",
+    "description": "This contract is built in two forms: the default build, and the build with the `phoenix-rotation` feature, which adds the host-authorized governance controls. They are alternative adoption targets. Each accepts only the unmigrated upstream 2.4.0 core as its predecessor, so a core adopted with the default build cannot migrate to the governance build. Adding the controls later needs a new, separately reviewed build.\n\nThe migration must be the adoption proposal's last message. The outgoing code dispatches anything placed after it, under none of this contract's checks.",
     "oneOf": [
       {
         "type": "object",

@@ -7,9 +7,9 @@ use osmosis_std::types::{
     },
 };
 
+use super::{require, GroupExecute, CORE, GROUP, PROPOSAL, VOTING};
 #[cfg(test)]
-use super::ProposalConfig;
-use super::{require, GroupExecute, ProposalExecute, CORE, GROUP, PROPOSAL, VOTING};
+use super::{ProposalConfig, ProposalExecute};
 
 fn companion(address: &str) -> bool {
     [GROUP, PROPOSAL, VOTING]
@@ -44,6 +44,19 @@ enum ProposalModuleAdmin {
     RemoveVoteHook {},
 }
 
+// Recognizes a config update by its name alone, whatever its fields.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProposalModuleConfig {
+    UpdateConfig {},
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProposalModuleDao {
+    UpdateConfig { dao: String },
+}
+
 fn check_contract_execute(address: &str, msg: &[u8]) -> StdResult<()> {
     if address.eq_ignore_ascii_case(GROUP) {
         require(
@@ -62,10 +75,15 @@ fn check_contract_execute(address: &str, msg: &[u8]) -> StdResult<()> {
         // A proposal can otherwise hand the module's DAO role to an
         // intermediary, have it perform one of the reserved admin calls, and
         // restore the DAO before the batch reply checks the final config.
-        if let Ok(ProposalExecute::UpdateConfig(config)) = from_json::<ProposalExecute>(msg) {
+        // Every config update must name the core, including one whose other
+        // fields this crate cannot read.
+        if from_json::<ProposalModuleConfig>(msg).is_ok() {
             require(
-                config.dao.eq_ignore_ascii_case(CORE),
-                "changing proposal module DAO requires governance",
+                matches!(
+                    from_json::<ProposalModuleDao>(msg),
+                    Ok(ProposalModuleDao::UpdateConfig { dao }) if dao.eq_ignore_ascii_case(CORE)
+                ),
+                "the proposal module's DAO must remain the core",
             )?;
         }
     }
@@ -177,7 +195,6 @@ mod tests {
                 r#"{"update_pre_propose_info":{"info":{"anyone_may_propose":{}}}}"#,
                 false,
             ),
-            (r#"{"update_config":{"dao":"fixture-dao"}}"#, true),
             (r#"{"execute":{"proposal_id":7}}"#, true),
         ] {
             let typed = WasmMsg::Execute {
@@ -210,42 +227,103 @@ mod tests {
         }
     }
 
+    // The single-choice module's `update_config` as it is sent on the wire,
+    // written out so the check is tested against the module's format and not
+    // against this crate's own types.
+    fn update_config(dao: &str, optional: &str) -> String {
+        format!(
+            r#"{{"update_config":{{"threshold":{{"absolute_count":{{"threshold":"75"}}}},"max_voting_period":{{"time":604800}},{optional}"only_members_execute":false,"allow_revoting":false,"dao":"{dao}","close_proposal_on_execution_failure":false}}}}"#
+        )
+    }
+
     #[test]
     fn ordinary_messages_cannot_delegate_proposal_module_administration() {
-        for (dao, allowed) in [(CORE, true), ("fixture-intermediary", false)] {
-            let msg =
-                cosmwasm_std::to_json_binary(&ProposalExecute::UpdateConfig(ProposalConfig {
-                    threshold: dao_voting::threshold::Threshold::AbsoluteCount {
-                        threshold: cosmwasm_std::Uint128::new(75),
-                    },
-                    max_voting_period: cw_utils::Duration::Time(604_800),
-                    min_voting_period: None,
-                    only_members_execute: false,
-                    allow_revoting: false,
-                    dao: dao.to_owned(),
-                    close_proposal_on_execution_failure: false,
-                    veto: None,
-                }))
-                .unwrap();
-            let typed = WasmMsg::Execute {
-                contract_addr: PROPOSAL.to_owned(),
-                msg: msg.clone(),
-                funds: vec![],
-            };
-            let native = MsgExecuteContract {
-                contract: PROPOSAL.to_owned(),
-                msg: msg.to_vec(),
-                ..Default::default()
-            };
-            assert_eq!(
-                check_messages(&Response::new().add_message(typed)).is_ok(),
-                allowed
-            );
-            assert_eq!(
-                check_messages(&Response::new().add_message(native)).is_ok(),
-                allowed
-            );
+        let other = "fixture-intermediary";
+        let optional = r#""min_voting_period":null,"veto":null,"#;
+        for (msg, allowed) in [
+            (update_config(CORE, optional), true),
+            (update_config(CORE, ""), true),
+            (update_config(other, optional), false),
+            (update_config(other, ""), false),
+            // A config update this crate cannot fully read still has to name
+            // the core.
+            (format!(r#"{{"update_config":{{"dao":"{CORE}"}}}}"#), true),
+            (
+                r#"{"update_config":{"dao":"fixture-dao"}}"#.to_owned(),
+                false,
+            ),
+            (
+                r#"{"update_config":{"dao":"fixture-dao","later_field":1}}"#.to_owned(),
+                false,
+            ),
+            (r#"{"update_config":{}}"#.to_owned(), false),
+            (r#"{"update_config":{"dao":7}}"#.to_owned(), false),
+            (
+                format!(r#"{{"update_config":{{"dao":"{CORE}","dao":"fixture-dao"}}}}"#),
+                false,
+            ),
+        ] {
+            for contract in [PROPOSAL.to_owned(), PROPOSAL.to_ascii_uppercase()] {
+                let typed = WasmMsg::Execute {
+                    contract_addr: contract.clone(),
+                    msg: Binary::from(msg.as_bytes()),
+                    funds: vec![],
+                };
+                let native = MsgExecuteContract {
+                    contract,
+                    msg: msg.as_bytes().to_vec(),
+                    ..Default::default()
+                };
+                let wrapped = MsgExec {
+                    msgs: vec![native.to_any()],
+                    ..Default::default()
+                };
+                assert_eq!(
+                    check_messages(&Response::new().add_message(typed)).is_ok(),
+                    allowed,
+                    "{msg}"
+                );
+                assert_eq!(
+                    check_messages(&Response::new().add_message(native)).is_ok(),
+                    allowed,
+                    "{msg}"
+                );
+                assert_eq!(
+                    check_messages(&Response::new().add_message(wrapped)).is_ok(),
+                    allowed,
+                    "{msg}"
+                );
+            }
         }
+    }
+
+    // The core writes config updates with its own types. They must stay in
+    // the wire format the check is tested against.
+    #[test]
+    fn core_config_updates_use_the_module_wire_format() {
+        let written = cosmwasm_std::to_json_vec(&ProposalExecute::UpdateConfig(ProposalConfig {
+            threshold: dao_voting::threshold::Threshold::AbsoluteCount {
+                threshold: cosmwasm_std::Uint128::new(75),
+            },
+            max_voting_period: cw_utils::Duration::Time(604_800),
+            min_voting_period: None,
+            only_members_execute: false,
+            allow_revoting: false,
+            dao: CORE.to_owned(),
+            close_proposal_on_execution_failure: false,
+            veto: None,
+        }))
+        .unwrap();
+        let written = String::from_utf8(written).unwrap();
+        assert!(
+            written.starts_with(r#"{"update_config":{"threshold":{"absolute_count":{"threshold":"75"}},"max_voting_period":{"time":604800},"min_voting_period":null,"only_members_execute":false,"allow_revoting":false,"dao":""#),
+            "{written}"
+        );
+        assert!(
+            written.ends_with(r#"","close_proposal_on_execution_failure":false,"veto":null}}"#),
+            "{written}"
+        );
+        assert!(check_contract_execute(PROPOSAL, written.as_bytes()).is_ok());
     }
 
     #[test]

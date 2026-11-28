@@ -110,6 +110,12 @@ Adoption classifies at most 512 proposals in all and reports any it leaves
 as `unscanned_proposals`. Those are classified afterwards, before anything
 can execute.
 
+Make the migration the last message of the adoption proposal. The outgoing
+code has already queued any message placed after it, so that message runs
+as the DAO under none of the checks described here and can undo what
+adoption just verified, such as the veto or the hook lists. Reject an
+adoption proposal that carries anything after the migration.
+
 The pinned proposal module's execution hook carries a proposal's messages
 and no ID, so blocked proposals are filed under their messages. A later
 proposal with the same messages executes normally. An execution reads at
@@ -145,9 +151,17 @@ messages to those contracts through their existing execute interfaces. The
 same check applies to the callback messages of a proposal module that an
 ordinary proposal adds. The dispatch check reserves membership group hooks
 and its internal admin for governance, and likewise the proposal module's
-DAO role, proposal hooks, vote hooks and pre-propose module. A hook runs on
-every status change or vote, so one could make a veto or the voting proxy's
-deciding vote fail.
+proposal hooks, vote hooks and pre-propose module. A hook runs on every
+status change or vote, so one could make a veto or the voting proxy's
+deciding vote fail. After an ordinary proposal's messages have run, the
+core also confirms that those hooks and the pre-propose setting are
+unchanged.
+
+The proposal module's DAO role stays with the core. Every config update an
+ordinary proposal sends to the module must name the core as its DAO, so a
+proposal cannot lend the role to another contract and take it back.
+Governance should not move the role either: ordinary execution and the
+governance membership actions fail until it is returned.
 
 When migration installs a governance veto, it requires a nonzero timelock
 and veto-before-passed support. The configured vetoer can therefore use the

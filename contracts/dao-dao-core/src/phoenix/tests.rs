@@ -35,6 +35,7 @@ struct Host {
     /// Proposal hooks and vote hooks registered on the proposal module.
     proposal_hooks: Vec<String>,
     vote_hooks: Vec<String>,
+    creation_policy: ProposalCreationPolicy,
 }
 
 fn proposal_msgs(host: &Host, id: u64) -> Vec<CosmosMsg> {
@@ -165,6 +166,7 @@ fn fixture(
         hooks: vec![],
         proposal_hooks: vec![],
         vote_hooks: vec![],
+        creation_policy: ProposalCreationPolicy::Anyone {},
     }));
     let querier_host = host.clone();
     let height = env.block.height;
@@ -254,9 +256,7 @@ fn fixture(
                     ProposalQuery::VoteHooks {} => to_json_binary(&HooksResponse {
                         hooks: h.vote_hooks.clone(),
                     }),
-                    ProposalQuery::ProposalCreationPolicy {} => {
-                        to_json_binary(&ProposalCreationPolicy::Anyone {})
-                    }
+                    ProposalQuery::ProposalCreationPolicy {} => to_json_binary(&h.creation_policy),
                     ProposalQuery::Proposal { proposal_id } => {
                         let record = h
                             .proposals

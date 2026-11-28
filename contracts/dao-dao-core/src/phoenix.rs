@@ -90,6 +90,10 @@ const GUARDED_BATCH: Item<GuardedBatch> = Item::new("phoenix_guarded_batch_v1");
 /// unmigrated upstream 2.4.0 core as its predecessor, so a core adopted with
 /// the default build cannot migrate to the governance build. Adding the
 /// controls later needs a new, separately reviewed build.
+///
+/// The migration must be the adoption proposal's last message. The outgoing
+/// code dispatches anything placed after it, under none of this contract's
+/// checks.
 #[cw_serde]
 pub enum MigrateMsg {
     AdoptPhoenix4856 {
@@ -226,6 +230,12 @@ struct GuardedBatch {
     veto: Option<VetoConfig>,
     members: Vec<cw4::Member>,
     hooks: Vec<String>,
+    /// The proposal module's proposal hooks, vote hooks and creation policy.
+    /// The dispatch check already refuses the messages that change them;
+    /// the reply confirms the result however the batch reached the module.
+    proposal_hooks: Vec<String>,
+    vote_hooks: Vec<String>,
+    creation_policy: ProposalCreationPolicy,
     seated_voting_period: Option<Duration>,
     /// The maximum and minimum voting periods while a veto is configured.
     /// They are the window in which an open proposal can be vetoed.
@@ -306,6 +316,12 @@ fn module_hooks(deps: Deps, query: &ProposalQuery) -> StdResult<Vec<String>> {
     let mut hooks = response.hooks;
     hooks.sort_unstable();
     Ok(hooks)
+}
+
+#[cfg(feature = "phoenix-rotation")]
+fn creation_policy(deps: Deps) -> StdResult<ProposalCreationPolicy> {
+    deps.querier
+        .query_wasm_smart(PROPOSAL, &ProposalQuery::ProposalCreationPolicy {})
 }
 
 fn check_reviewed_hooks(
@@ -953,6 +969,9 @@ fn guard_pinned_config(deps: DepsMut, mut response: Response) -> StdResult<Respo
     let seated_voting_period =
         governance::has_seat(deps.storage, &members)?.then_some(cfg.max_voting_period);
     let hooks = group_hooks(deps.as_ref())?;
+    let proposal_hooks = module_hooks(deps.as_ref(), &ProposalQuery::ProposalHooks {})?;
+    let vote_hooks = module_hooks(deps.as_ref(), &ProposalQuery::VoteHooks {})?;
+    let creation_policy = creation_policy(deps.as_ref())?;
     let veto_periods = cfg
         .veto
         .as_ref()
@@ -964,6 +983,9 @@ fn guard_pinned_config(deps: DepsMut, mut response: Response) -> StdResult<Respo
             veto: cfg.veto,
             members,
             hooks,
+            proposal_hooks,
+            vote_hooks,
+            creation_policy,
             seated_voting_period,
             veto_periods,
         },
@@ -1009,6 +1031,14 @@ pub(crate) fn guard_reply(deps: DepsMut, env: &Env, id: u64) -> StdResult<Option
     require(
         group_hooks(deps.as_ref())? == batch.hooks,
         "changing group hooks requires governance",
+    )?;
+    // A proposal or vote hook runs inside every status change or vote, and
+    // the pre-propose module decides who can open a proposal.
+    require(
+        module_hooks(deps.as_ref(), &ProposalQuery::ProposalHooks {})? == batch.proposal_hooks
+            && module_hooks(deps.as_ref(), &ProposalQuery::VoteHooks {})? == batch.vote_hooks
+            && creation_policy(deps.as_ref())? == batch.creation_policy,
+        "changing proposal module hooks or pre-propose requires governance",
     )?;
     let members = governance::check_current_roster(deps.as_ref())?;
     require(

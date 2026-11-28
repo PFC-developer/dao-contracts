@@ -1028,6 +1028,39 @@ fn adoption_requires_the_reviewed_group_hooks() {
     assert!(expected_group_hooks.is_empty());
 }
 
+// The dispatch check refuses the messages that change these. The reply does
+// not depend on having recognized the message that did it.
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn ordinary_proposal_cannot_change_proposal_module_hooks_or_pre_propose() {
+    let changes: [fn(&mut Host); 3] = [
+        |host| host.proposal_hooks.push("fixture-hook".to_owned()),
+        |host| host.vote_hooks.push("fixture-hook".to_owned()),
+        |host| {
+            host.creation_policy = ProposalCreationPolicy::Module {
+                addr: Addr::unchecked("fixture-pre-propose"),
+            }
+        },
+    ];
+    for change in changes {
+        let (mut deps, mut env, host) = settled(&[]);
+        env.block.height += 1;
+        hook(deps.as_mut(), &env, &fixture_msg("module admin")).unwrap();
+        change(&mut host.borrow_mut());
+        assert!(finish_guard(deps.as_mut(), &env)
+            .unwrap_err()
+            .to_string()
+            .contains("changing proposal module hooks or pre-propose requires governance"));
+    }
+
+    // Hooks and a pre-propose module that governance installed stay in place.
+    let (mut deps, mut env, host) = settled(&[]);
+    host.borrow_mut().vote_hooks = vec!["fixture-hook".to_owned()];
+    env.block.height += 1;
+    hook(deps.as_mut(), &env, &fixture_msg("unrelated")).unwrap();
+    finish_guard(deps.as_mut(), &env).unwrap();
+}
+
 #[cfg(feature = "phoenix-rotation")]
 #[test]
 fn ordinary_proposal_cannot_change_group_hooks() {

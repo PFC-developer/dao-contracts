@@ -574,6 +574,46 @@ fn veto_only_seat_is_recorded_without_a_ballot_and_can_be_seated_later() {
     );
 }
 
+#[test]
+fn governance_veto_requires_open_and_post_passage_windows() {
+    let veto = |duration, veto_before_passed| VetoConfig {
+        timelock_duration: duration,
+        vetoer: GOV.to_owned(),
+        early_execute: false,
+        veto_before_passed,
+    };
+    for refused in [
+        veto(Duration::Time(86_400), false),
+        veto(Duration::Time(0), true),
+        veto(Duration::Height(0), true),
+    ] {
+        let (mut deps, env, _, mut payload) = fixture(4);
+        let mut opts = options(None);
+        opts.veto = Some(refused);
+        with_options(&mut payload, opts);
+        assert!(migrate(deps.as_mut(), env, payload)
+            .unwrap_err()
+            .to_string()
+            .contains("must cover open and post-passage proposals"));
+    }
+
+    for duration in [Duration::Time(1), Duration::Height(1)] {
+        let (mut deps, env, host, mut payload) = fixture(4);
+        if matches!(duration, Duration::Height(_)) {
+            host.borrow_mut().config.max_voting_period = Duration::Height(10);
+            let MigrateMsg::AdoptPhoenix4856 {
+                expected_proposal_config,
+                ..
+            } = &mut payload;
+            expected_proposal_config.max_voting_period = Duration::Height(10);
+        }
+        let mut opts = options(None);
+        opts.veto = Some(veto(duration, true));
+        with_options(&mut payload, opts);
+        assert!(migrate(deps.as_mut(), env, payload).is_ok());
+    }
+}
+
 #[cfg(not(feature = "phoenix-rotation"))]
 #[test]
 fn default_build_refuses_a_veto_only_seat() {

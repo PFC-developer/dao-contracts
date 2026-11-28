@@ -138,6 +138,11 @@ same check applies to the callback messages of a proposal module that an
 ordinary proposal adds. The dispatch check reserves membership group hooks
 and its internal admin for governance.
 
+When migration installs a governance veto, it requires a nonzero timelock
+and veto-before-passed support. The configured vetoer can therefore use the
+proposal module's ordinary veto while a proposal is open or during its
+post-passage timelock.
+
 These controls bind only once governance is the core's host admin. With
 `KeepCurrentAdmin` the core stays its own admin and the DAO keeps upgrade
 authority, so an ordinary proposal can migrate the core or reassign its

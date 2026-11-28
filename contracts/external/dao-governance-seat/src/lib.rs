@@ -298,14 +298,17 @@ fn check_deadlock(
         "proposal is not open under the supported voting rules",
     )?;
     // The seat has not voted, so every recorded ballot belongs to a director.
-    // A completed 2–1 or 2–2 split qualifies immediately. When only the two
-    // YES ballots have arrived, the other directors get the full window.
-    let split = proposal.votes.no == weight.checked_mul(Uint128::from(directors - 2))?;
+    // A completed 2–1 or 2–2 split qualifies immediately. Otherwise the
+    // directors who have not voted get the full response window; after it,
+    // 2 YES / 1 NO / 1 silent is a deadlock just like 2 YES / 2 NO.
+    let maximum_no = weight.checked_mul(Uint128::from(directors - 2))?;
+    let complete_split = proposal.votes.no == maximum_no;
     let elapsed = height >= proposal.start_height.saturating_add(config.response_blocks);
     require(
         proposal.votes.yes == weight.checked_mul(Uint128::new(2))?
             && proposal.votes.abstain.is_zero()
-            && (split || (elapsed && proposal.votes.no.is_zero())),
+            && proposal.votes.no <= maximum_no
+            && (complete_split || elapsed),
         "proposal is not deadlocked",
     )
 }
@@ -371,12 +374,18 @@ mod tests {
     }
 
     #[test]
-    fn partial_ballots_with_a_no_or_abstention_do_not_qualify() {
-        for (no, abstain) in [(25, 0), (0, 25)] {
-            let (proposal, config) = setup(50, no, abstain);
-            assert!(check_deadlock(&proposal, 4, &config, 101).is_err());
-            assert!(check_deadlock(&proposal, 4, &config, 109).is_err());
-            assert!(check_deadlock(&proposal, 4, &config, 110).is_err());
+    fn partial_two_yes_one_no_waits_for_the_response_window() {
+        let (proposal, config) = setup(50, 25, 0);
+        assert!(check_deadlock(&proposal, 4, &config, 101).is_err());
+        assert!(check_deadlock(&proposal, 4, &config, 109).is_err());
+        assert!(check_deadlock(&proposal, 4, &config, 110).is_ok());
+    }
+
+    #[test]
+    fn abstentions_never_qualify_after_partial_turnout() {
+        let (proposal, config) = setup(50, 0, 25);
+        for height in [101, 109, 110, 1_000] {
+            assert!(check_deadlock(&proposal, 4, &config, height).is_err());
         }
     }
 

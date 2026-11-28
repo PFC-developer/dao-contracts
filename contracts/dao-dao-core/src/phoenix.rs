@@ -1087,6 +1087,14 @@ pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, Con
                 veto.vetoer == GOV || opts.seat.as_ref().is_some_and(|s| s.address == veto.vetoer),
                 "expected governance vetoer",
             )?;
+            require(
+                veto.veto_before_passed
+                    && matches!(
+                        veto.timelock_duration,
+                        Duration::Height(value) | Duration::Time(value) if value > 0
+                    ),
+                "governance veto must cover open and post-passage proposals",
+            )?;
             cfg.veto = Some(veto);
         }
         if let Some(approved) = opts.seat {

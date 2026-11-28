@@ -53,8 +53,13 @@ const PROPOSALS_PER_QUERY: u64 = 12;
 const PROPOSALS_PER_CHECKPOINT: u64 = 4 * PROPOSALS_PER_QUERY;
 
 // Bounds the work one execution does for blocked proposals that carry the same
-// messages as the executing one. It never limits a boundary.
+// messages as the executing one. It never limits a boundary. An execution
+// reads at most twice this many rows, drops the settled ones, and fails only
+// if more than this many still block.
 const MAX_GATED_PER_PAYLOAD: usize = 64;
+const MAX_PAYLOAD_ROWS_READ: usize = 2 * MAX_GATED_PER_PAYLOAD;
+// Settled rows each successful execution retires, whatever its messages.
+const ROWS_PRUNED_PER_EXECUTION: usize = 4;
 #[cfg(feature = "phoenix-rotation")]
 const GUARD_REPLY_ID: u64 = 4856;
 #[cfg(feature = "phoenix-rotation")]
@@ -73,7 +78,6 @@ type PayloadKey = [u8; 32];
 const GATED: Map<(&[u8], u64), ()> = Map::new("phoenix_gated_messages_v2");
 /// Rows beyond the boundary are staged by checkpointing and do not gate execution.
 const INDEXED: Map<u64, Option<PayloadKey>> = Map::new("phoenix_indexed_proposals_v2");
-#[cfg(feature = "phoenix-rotation")]
 const PRUNE_CURSOR: Item<u64> = Item::new("phoenix_proposal_prune_cursor_v2");
 #[cfg(feature = "phoenix-rotation")]
 const PENDING_HISTORY: Item<PendingHistory> = Item::new("phoenix_pending_history_v2");
@@ -217,8 +221,18 @@ struct PlannedBoundary {
     /// Newly blocked proposals with the key their messages are filed under.
     /// A proposal whose messages can never reach the core has no key.
     gated: Vec<(u64, Option<PayloadKey>)>,
+    /// Still-unresolved proposals among the first staged rows the boundary
+    /// activates, and whether more staged rows exist than were read.
     already_indexed: Vec<u64>,
+    more_staged: bool,
     settled: Vec<(u64, Option<PayloadKey>)>,
+}
+
+/// The proposals a boundary reports as newly blocked.
+struct Blocked {
+    ids: Vec<u64>,
+    /// More staged proposals were activated than the report lists.
+    truncated: bool,
 }
 
 fn require(condition: bool, message: impl Into<String>) -> StdResult<()> {
@@ -353,6 +367,15 @@ fn load_proposal(deps: Deps, id: u64) -> StdResult<ProposalSnapshot> {
     Ok(record.proposal)
 }
 
+// Statuses from which a proposal can never execute. `Executed` is not one of
+// them: during an execution hook it is also the status of the running proposal.
+fn is_dead(status: &Status) -> bool {
+    matches!(
+        status,
+        Status::Rejected | Status::Closed | Status::ExecutionFailed | Status::Vetoed
+    )
+}
+
 fn is_resolved(status: &Status) -> bool {
     matches!(
         status,
@@ -399,7 +422,13 @@ fn visit_proposals(
 
 #[cfg(feature = "phoenix-rotation")]
 fn checkpoint_history(mut deps: DepsMut, boundary: &SnapshotBoundary) -> StdResult<Response> {
-    prune_resolved(deps.branch())?;
+    // Checkpoints run as native governance, outside a proposal hook, so an
+    // executed proposal is settled here and its row can go too.
+    let (pruned, prune_complete) = prune_rows(
+        deps.branch(),
+        PROPOSALS_PER_CHECKPOINT as usize,
+        is_resolved,
+    )?;
     let through = PENDING_HISTORY
         .may_load(deps.storage)?
         .map_or(boundary.proposal_count, |history| {
@@ -435,7 +464,10 @@ fn checkpoint_history(mut deps: DepsMut, boundary: &SnapshotBoundary) -> StdResu
     Ok(Response::new()
         .add_attribute("action", "checkpoint_proposal_history")
         .add_attribute("checked_through", end.to_string())
-        .add_attribute("proposal_count", count.to_string()))
+        .add_attribute("proposal_count", count.to_string())
+        .add_attribute("boundary_cursor", tail.to_string())
+        .add_attribute("pruned", pruned.to_string())
+        .add_attribute("prune_complete", prune_complete.to_string()))
 }
 
 fn payload_key<'a>(msgs: impl IntoIterator<Item = &'a CosmosMsg<Empty>>) -> StdResult<PayloadKey> {
@@ -474,26 +506,33 @@ fn remove_indexed(storage: &mut dyn Storage, id: u64, key: Option<PayloadKey>) {
     INDEXED.remove(storage, id);
 }
 
-// Checkpoint callbacks run as native governance, outside a proposal hook.
-// They can retire settled duplicates without attempting another execution.
-#[cfg(feature = "phoenix-rotation")]
-fn prune_resolved(deps: DepsMut) -> StdResult<()> {
+// Walk the index a bounded batch at a time and drop the rows `settled`
+// accepts. The cursor wraps, so repeated calls cover every row. Returns the
+// number of rows dropped and whether this call reached the end of the index.
+fn prune_rows(
+    deps: DepsMut,
+    batch: usize,
+    settled: fn(&Status) -> bool,
+) -> StdResult<(usize, bool)> {
     let start = PRUNE_CURSOR.may_load(deps.storage)?.map(Bound::exclusive);
     let entries = INDEXED
         .range(deps.storage, start, None, Order::Ascending)
-        .take(PROPOSALS_PER_CHECKPOINT as usize)
+        .take(batch)
         .collect::<StdResult<Vec<_>>>()?;
+    let mut pruned = 0;
     for &(id, key) in &entries {
-        if is_resolved(&load_proposal(deps.as_ref(), id)?.status) {
+        if settled(&load_proposal(deps.as_ref(), id)?.status) {
             remove_indexed(deps.storage, id, key);
+            pruned += 1;
         }
     }
-    if entries.len() == PROPOSALS_PER_CHECKPOINT as usize {
-        PRUNE_CURSOR.save(deps.storage, &entries.last().unwrap().0)?;
-    } else {
+    let complete = entries.len() < batch;
+    if complete {
         PRUNE_CURSOR.remove(deps.storage);
+    } else {
+        PRUNE_CURSOR.save(deps.storage, &entries.last().expect("full batch").0)?;
     }
-    Ok(())
+    Ok((pruned, complete))
 }
 
 // Classify proposals since the last boundary. Those up to the reviewed ID
@@ -556,32 +595,42 @@ fn plan_boundary(deps: Deps, checked: u64, reviewed: u64) -> StdResult<PlannedBo
         }
         Ok(())
     })?;
-    // Staged entries already have message keys. Report a bounded list and
-    // activate every staged row by committing the new proposal count.
-    let already_indexed = if through > checked.max(reviewed) {
-        INDEXED
+    // Staged entries already have message keys. Committing the new proposal
+    // count activates every staged row. Report the ones among a bounded first
+    // batch that can still execute, and say when there are more.
+    let mut already_indexed = Vec::new();
+    let mut more_staged = false;
+    if through > checked.max(reviewed) {
+        for (offset, id) in INDEXED
             .keys(
                 deps.storage,
                 Some(Bound::exclusive(checked.max(reviewed))),
                 Some(Bound::inclusive(through)),
                 Order::Ascending,
             )
-            .take(PROPOSALS_PER_QUERY as usize)
-            .collect::<StdResult<Vec<_>>>()?
-    } else {
-        vec![]
-    };
+            .take(PROPOSALS_PER_QUERY as usize + 1)
+            .enumerate()
+        {
+            let id = id?;
+            if offset == PROPOSALS_PER_QUERY as usize {
+                more_staged = true;
+            } else if !is_resolved(&load_proposal(deps, id)?.status) {
+                already_indexed.push(id);
+            }
+        }
+    }
     Ok(PlannedBoundary {
         proposal_count: count,
         gated,
         already_indexed,
+        more_staged,
         settled,
     })
 }
 
 impl PlannedBoundary {
     /// Record the boundary and return the proposals it newly blocks.
-    fn save(self, storage: &mut dyn Storage, height: u64) -> StdResult<Vec<u64>> {
+    fn save(self, storage: &mut dyn Storage, height: u64) -> StdResult<Blocked> {
         #[cfg(feature = "phoenix-rotation")]
         PENDING_HISTORY.remove(storage);
         for (id, key) in self.settled {
@@ -597,20 +646,26 @@ impl PlannedBoundary {
                 proposal_count: self.proposal_count,
             },
         )?;
-        Ok(self
-            .already_indexed
-            .into_iter()
-            .chain(self.gated.into_iter().map(|(id, _)| id))
-            .collect())
+        Ok(Blocked {
+            ids: self
+                .already_indexed
+                .into_iter()
+                .chain(self.gated.into_iter().map(|(id, _)| id))
+                .collect(),
+            truncated: self.more_staged,
+        })
     }
 }
 
-fn gated_attribute(response: Response, gated: &[u64]) -> Response {
-    if gated.is_empty() {
-        return response;
+fn gated_attribute(mut response: Response, blocked: &Blocked) -> Response {
+    if !blocked.ids.is_empty() {
+        let ids: Vec<_> = blocked.ids.iter().map(u64::to_string).collect();
+        response = response.add_attribute("gated_proposals", ids.join(","));
     }
-    let ids: Vec<_> = gated.iter().map(u64::to_string).collect();
-    response.add_attribute("gated_proposals", ids.join(","))
+    if blocked.truncated {
+        response = response.add_attribute("gated_proposals_truncated", "true");
+    }
+    response
 }
 
 // Whether a proposal that predates the boundary must stay gated. Fails when it
@@ -643,7 +698,7 @@ fn stays_gated(deps: Deps, id: u64, status: &Status, hook: &[SubMsg]) -> StdResu
 /// normally. The source module assigns contiguous IDs in increasing chain
 /// height order.
 pub(crate) fn gate_execution(
-    deps: DepsMut,
+    mut deps: DepsMut,
     env: &Env,
     sender: &Addr,
     response: Response,
@@ -677,9 +732,16 @@ pub(crate) fn gate_execution(
             if record.proposal.start_height > boundary.height {
                 break 'tail;
             }
+            // Governance can advance a long tail in bounded checkpoints. The
+            // default build has no other path, so there this execution must
+            // finish the tail itself: filing a proposal costs less than
+            // creating one, and every proposal in the tail was created in a
+            // single block.
+            #[cfg(feature = "phoenix-rotation")]
             require(
                 cursor - boundary.proposal_count < MAX_PROPOSALS_TO_CHECK,
-                "too many proposals created at the boundary height",
+                "too many proposals created at the boundary height; \
+                 checkpoint proposal history first",
             )?;
             cursor = record.id;
             if stays_gated(
@@ -707,6 +769,8 @@ pub(crate) fn gate_execution(
         )?;
     }
     // Only blocked proposals that carry these messages can be the one running.
+    // Settled rows are dropped before the rest are counted, so a payload is
+    // usable again once enough of its blocked proposals have settled.
     let key = payload_key(response.messages.iter().map(|m| &m.msg))?;
     let candidates = GATED
         .prefix(&key)
@@ -716,22 +780,31 @@ pub(crate) fn gate_execution(
             Some(Bound::inclusive(cursor)),
             Order::Ascending,
         )
-        .take(MAX_GATED_PER_PAYLOAD + 1)
+        .take(MAX_PAYLOAD_ROWS_READ + 1)
         .collect::<StdResult<Vec<_>>>()?;
     require(
-        candidates.len() <= MAX_GATED_PER_PAYLOAD,
+        candidates.len() <= MAX_PAYLOAD_ROWS_READ,
         "too many blocked proposals carry these messages",
     )?;
+    let mut blocking = 0;
     for id in candidates {
         let proposal = load_proposal(deps.as_ref(), id)?;
-        if !stays_gated(deps.as_ref(), id, &proposal.status, &response.messages)? {
+        if stays_gated(deps.as_ref(), id, &proposal.status, &response.messages)? {
+            blocking += 1;
+        } else {
             remove_indexed(deps.storage, id, Some(key));
         }
     }
+    require(
+        blocking <= MAX_GATED_PER_PAYLOAD,
+        "too many blocked proposals carry these messages",
+    )?;
     #[cfg(feature = "phoenix-rotation")]
     if PENDING_HISTORY.may_load(deps.storage)?.is_some() {
-        // Staged proposals can still execute. Retire their rows when they
-        // settle so a later boundary does not activate an executed entry.
+        // Staged proposals can still execute. The running one may be among
+        // them, so every staged row for these messages is read: a row left
+        // behind for an executed proposal would be activated by the next
+        // boundary and then refuse each later proposal with the same messages.
         let staged = GATED
             .prefix(&key)
             .keys(
@@ -740,14 +813,24 @@ pub(crate) fn gate_execution(
                 None,
                 Order::Ascending,
             )
-            .take(PROPOSALS_PER_QUERY as usize)
+            .take(MAX_GATED_PER_PAYLOAD + 1)
             .collect::<StdResult<Vec<_>>>()?;
+        require(
+            staged.len() <= MAX_GATED_PER_PAYLOAD,
+            "too many staged proposals carry these messages",
+        )?;
         for id in staged {
             if is_resolved(&load_proposal(deps.as_ref(), id)?.status) {
                 remove_indexed(deps.storage, id, Some(key));
             }
         }
     }
+    // Retire a few rows of proposals that can never execute, whatever their
+    // messages. This is what clears a payload with more rows than one
+    // execution reads, including in the default build, which has no
+    // checkpoint. It never drops an executed row, which could be a blocked
+    // proposal that is running in this transaction.
+    prune_rows(deps.branch(), ROWS_PRUNED_PER_EXECUTION, is_dead)?;
     guard_pinned_config(deps, response)
 }
 
@@ -767,6 +850,11 @@ pub(crate) fn guard_admin_messages(_deps: Deps, response: Response) -> StdResult
 
 /// The outermost hook owns the reply and checks proposals created by nested
 /// calls too. All dispatched messages and their replies share the transaction.
+///
+/// If the batch migrates this core, the reply is delivered to the successor
+/// code. A successor must handle reply `GUARD_REPLY_ID` (and `SEND_REPLY_ID`
+/// for a governance send) or the batch fails; a self-administered core moves
+/// to other code by reassigning its host admin first.
 #[cfg(feature = "phoenix-rotation")]
 fn guard_pinned_config(deps: DepsMut, mut response: Response) -> StdResult<Response> {
     if response.messages.is_empty() {

@@ -15,8 +15,13 @@ pub enum SudoMsg {
         expected_proposal_count: u64,
         changes: Vec<MemberChange>,
     },
-    /// Classify up to 48 proposals toward the next membership change.
-    /// Repeat until the reported cursor has caught up with the proposal count.
+    /// Classify up to 48 proposals toward the next membership change, and
+    /// prune up to 48 settled entries from the blocked-proposal index.
+    /// Repeat until `checked_through` has caught up with `proposal_count`.
+    /// Pruning walks the index with its own cursor and can need more calls:
+    /// `pruned` reports the entries dropped and `prune_complete` is `false`
+    /// while the walk has not reached the end of the index. `boundary_cursor`
+    /// reports how far a long same-block tail has been advanced.
     ///
     /// A membership change scans at most 512 proposals created since the last
     /// boundary or checkpoint. Past that, every membership change fails,

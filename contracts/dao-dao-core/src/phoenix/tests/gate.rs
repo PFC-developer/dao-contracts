@@ -131,14 +131,13 @@ fn proposal_created_after_review_is_gated_instead_of_blocking_adoption() {
         .contains("proposal 2 predates the current membership"));
     assert_eq!(gated(&deps), vec![2]);
 
-    // The module records the failure. Other proposals are unaffected, and a
-    // new proposal carrying the same messages executes and drops the entry.
+    // The module records the failure. A new proposal carrying the same
+    // messages executes and drops the entry.
     set_status(&host, 2, Status::ExecutionFailed);
-    assert!(hook(deps.as_mut(), &env, &later).is_ok());
-    assert_eq!(gated(&deps), vec![2]);
     assert!(hook(deps.as_mut(), &env, &stale).is_ok());
     assert!(gated(&deps).is_empty());
     assert!(hook(deps.as_mut(), &env, &stale).is_ok());
+    assert!(hook(deps.as_mut(), &env, &later).is_ok());
 }
 
 #[test]
@@ -166,12 +165,106 @@ fn settled_gated_proposals_are_dropped_by_a_proposal_with_the_same_messages() {
         assert_eq!(gated(&deps), vec![2, 3]);
         env.block.height += 1;
         set_status(&host, 2, status);
-        // An execution reads only the entry for its own messages.
-        assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
-        assert_eq!(gated(&deps), vec![2, 3]);
         assert!(hook(deps.as_mut(), &env, &msgs_of(&host, 2)).is_ok());
         assert_eq!(gated(&deps), vec![3]);
     }
+}
+
+#[test]
+fn every_execution_retires_a_few_settled_entries_but_never_an_executed_one() {
+    let after_review = vec![Status::Open; 3 * ROWS_PRUNED_PER_EXECUTION];
+    let ((mut deps, mut env, host), _) = adopted(&after_review);
+    let rows = after_review.len() as u64;
+    env.block.height += 1;
+    let later = fixture_msg("later");
+
+    // Nothing has settled, so nothing is retired.
+    assert!(hook(deps.as_mut(), &env, &later).is_ok());
+    assert_eq!(gated(&deps).len() as u64, rows);
+
+    // A blocked proposal the module reports as executed keeps its entry: it
+    // may be the one whose execution is about to be refused.
+    for id in 2..=rows + 1 {
+        set_status(&host, id, Status::Executed);
+    }
+    for _ in 0..3 {
+        assert!(hook(deps.as_mut(), &env, &later).is_ok());
+    }
+    assert_eq!(gated(&deps).len() as u64, rows);
+    assert!(hook(deps.as_mut(), &env, &msgs_of(&host, 2)).is_err());
+
+    // Rejected ones go a batch at a time, and the walk wraps around.
+    for id in 2..=rows + 1 {
+        set_status(&host, id, Status::Rejected);
+    }
+    for remaining in [2, 1, 0, 0] {
+        assert!(hook(deps.as_mut(), &env, &later).is_ok());
+        assert_eq!(
+            gated(&deps).len(),
+            remaining * ROWS_PRUNED_PER_EXECUTION,
+            "after an execution"
+        );
+    }
+}
+
+#[test]
+fn settled_payload_is_usable_again_however_many_proposals_blocked_it() {
+    let shared = fixture_msg("shared");
+    let block = |rows: usize| {
+        let (mut deps, env, host, payload) = fixture(4);
+        for _ in 0..rows {
+            let id = push(&host, env.block.height - 1, Status::Open);
+            set_msgs(&host, id, &shared);
+        }
+        migrate(deps.as_mut(), env.clone(), payload).unwrap();
+        let mut env = env;
+        env.block.height += 1;
+        (deps, env, host)
+    };
+    let settle = |host: &Rc<RefCell<Host>>, rows: usize| {
+        for id in 2..rows as u64 + 2 {
+            set_status(host, id, Status::Rejected);
+        }
+    };
+
+    // Up to twice the limit, one execution drops the settled rows itself.
+    let rows = MAX_PAYLOAD_ROWS_READ;
+    let (mut deps, env, host) = block(rows);
+    assert!(hook(deps.as_mut(), &env, &shared)
+        .unwrap_err()
+        .to_string()
+        .contains("too many blocked proposals carry these messages"));
+    settle(&host, rows);
+    assert!(hook(deps.as_mut(), &env, &shared).is_ok());
+    assert!(gated(&deps).is_empty());
+
+    // Past that, other executions retire the settled rows until it fits.
+    let rows = MAX_PAYLOAD_ROWS_READ + ROWS_PRUNED_PER_EXECUTION + 1;
+    let (mut deps, env, host) = block(rows);
+    settle(&host, rows);
+    let later = fixture_msg("later");
+    assert!(hook(deps.as_mut(), &env, &shared).is_err());
+    assert!(hook(deps.as_mut(), &env, &later).is_ok());
+    assert!(hook(deps.as_mut(), &env, &shared).is_err());
+    assert!(hook(deps.as_mut(), &env, &later).is_ok());
+    assert!(hook(deps.as_mut(), &env, &shared).is_ok());
+    assert!(gated(&deps).is_empty());
+}
+
+#[cfg(not(feature = "phoenix-rotation"))]
+#[test]
+fn default_build_finishes_a_long_boundary_height_tail_itself() {
+    let ((mut deps, mut env, host), _) = adopted(&[]);
+    let tail = MAX_PROPOSALS_TO_CHECK + 100;
+    for _ in 0..tail {
+        push(&host, env.block.height, Status::Open);
+    }
+    env.block.height += 1;
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+    assert_eq!(cursor(&deps), tail + 1);
+    assert_eq!(gated(&deps).len() as u64, tail);
+    set_status(&host, tail + 1, Status::Executed);
+    assert!(hook(deps.as_mut(), &env, &msgs_of(&host, tail + 1)).is_err());
 }
 
 #[test]
@@ -1116,4 +1209,172 @@ fn two_membership_actions_succeed_in_one_block() {
         BOUNDARY.load(&deps.storage).unwrap().height,
         env.block.height
     );
+}
+
+#[cfg(feature = "phoenix-rotation")]
+fn checkpoint(deps: DepsMut, env: &Env) -> Response {
+    sudo(deps, env.clone(), SudoMsg::CheckpointProposalHistory {}).unwrap()
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn staged_proposal_that_executes_leaves_no_entry_for_the_next_boundary() {
+    let shared = fixture_msg("shared");
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    // More proposals with the same messages than one proposal query page.
+    let staged = PROPOSALS_PER_QUERY + 1;
+    for _ in 0..staged {
+        let id = push(&host, env.block.height, Status::Open);
+        set_msgs(&host, id, &shared);
+    }
+    let last = staged + 1;
+    env.block.height += 1;
+    checkpoint(deps.as_mut(), &env);
+    assert_eq!(PENDING_HISTORY.load(&deps.storage).unwrap().through, last);
+
+    // The last one passes and executes under the roster it was created with.
+    set_status(&host, last, Status::Executed);
+    hook(deps.as_mut(), &env, &shared).unwrap();
+    finish_guard(deps.as_mut(), &env).unwrap();
+
+    sudo(
+        deps.as_mut(),
+        env.clone(),
+        SudoMsg::UpdateMembership {
+            expected_members: host.borrow().members.clone(),
+            expected_proposal_count: 1,
+            changes: swap_member(),
+        },
+    )
+    .unwrap();
+    assert_eq!(gated(&deps), (2..last).collect::<Vec<_>>());
+
+    // A proposal created under the new roster with the same messages executes.
+    env.block.height += 1;
+    let fresh = push(&host, env.block.height, Status::Executed);
+    set_msgs(&host, fresh, &shared);
+    assert!(hook(deps.as_mut(), &env, &shared).is_ok());
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn execution_fails_while_too_many_staged_proposals_carry_its_messages() {
+    let shared = fixture_msg("shared");
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    for _ in 0..=MAX_GATED_PER_PAYLOAD {
+        let id = push(&host, env.block.height, Status::Open);
+        set_msgs(&host, id, &shared);
+    }
+    env.block.height += 1;
+    checkpoint(deps.as_mut(), &env);
+    checkpoint(deps.as_mut(), &env);
+    assert!(hook(deps.as_mut(), &env, &shared)
+        .unwrap_err()
+        .to_string()
+        .contains("too many staged proposals carry these messages"));
+    assert!(hook(deps.as_mut(), &env, &fixture_msg("later")).is_ok());
+
+    // One settles, and the pruning walk retires its row when it reaches it.
+    set_status(&host, 2, Status::Rejected);
+    let mut calls = 0;
+    while attribute(&checkpoint(deps.as_mut(), &env), "pruned") == Some("0") {
+        calls += 1;
+        assert!(calls < 4, "pruning never reached the settled row");
+    }
+    assert!(hook(deps.as_mut(), &env, &shared).is_ok());
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn boundary_reports_only_staged_proposals_that_can_still_execute() {
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    let staged = PROPOSALS_PER_QUERY + 2;
+    for _ in 0..staged {
+        push(&host, env.block.height, Status::Open);
+    }
+    env.block.height += 1;
+    checkpoint(deps.as_mut(), &env);
+    // Two of the staged proposals settle before membership changes.
+    set_status(&host, 2, Status::Rejected);
+    set_status(&host, 3, Status::Closed);
+    let response = sudo(
+        deps.as_mut(),
+        env.clone(),
+        SudoMsg::UpdateMembership {
+            expected_members: host.borrow().members.clone(),
+            expected_proposal_count: 1,
+            changes: swap_member(),
+        },
+    )
+    .unwrap();
+    let expected: Vec<_> = (4..=PROPOSALS_PER_QUERY + 1)
+        .map(|id| id.to_string())
+        .collect();
+    assert_eq!(
+        attribute(&response, "gated_proposals"),
+        Some(expected.join(",").as_str())
+    );
+    assert_eq!(
+        attribute(&response, "gated_proposals_truncated"),
+        Some("true")
+    );
+
+    // With every staged proposal listed, the report is not marked truncated.
+    let (mut deps, mut env, host) = settled(&[]);
+    env.block.height += 1;
+    let open = push(&host, env.block.height, Status::Open);
+    env.block.height += 1;
+    checkpoint(deps.as_mut(), &env);
+    let response = sudo(
+        deps.as_mut(),
+        env,
+        SudoMsg::UpdateMembership {
+            expected_members: host.borrow().members.clone(),
+            expected_proposal_count: 1,
+            changes: swap_member(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        attribute(&response, "gated_proposals"),
+        Some(open.to_string().as_str())
+    );
+    assert_eq!(attribute(&response, "gated_proposals_truncated"), None);
+}
+
+#[cfg(feature = "phoenix-rotation")]
+#[test]
+fn checkpoint_reports_its_pruning_and_tail_progress() {
+    let (mut deps, mut env, host) = settled(&[]);
+    // Two proposals in the boundary block, then enough later ones that
+    // pruning needs more than one call.
+    push(&host, env.block.height, Status::Open);
+    push(&host, env.block.height, Status::Open);
+    env.block.height += 1;
+    for _ in 0..PROPOSALS_PER_CHECKPOINT {
+        push(&host, env.block.height, Status::Open);
+    }
+    env.block.height += 1;
+    let first = checkpoint(deps.as_mut(), &env);
+    assert_eq!(attribute(&first, "boundary_cursor"), Some("3"));
+    assert_eq!(attribute(&first, "pruned"), Some("0"));
+    assert_eq!(attribute(&first, "prune_complete"), Some("true"));
+    assert_eq!(cursor(&deps), 3);
+    checkpoint(deps.as_mut(), &env);
+
+    // The walk resumes where the previous call stopped and then wraps, so the
+    // events say when another call is still needed.
+    for id in 2..=PROPOSALS_PER_CHECKPOINT + 3 {
+        set_status(&host, id, Status::Rejected);
+    }
+    let full_batch = PROPOSALS_PER_CHECKPOINT.to_string();
+    for (pruned, complete) in [("2", "true"), (full_batch.as_str(), "false"), ("0", "true")] {
+        let response = checkpoint(deps.as_mut(), &env);
+        assert_eq!(attribute(&response, "pruned"), Some(pruned));
+        assert_eq!(attribute(&response, "prune_complete"), Some(complete));
+    }
+    assert!(gated(&deps).is_empty());
 }
